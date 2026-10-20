@@ -737,7 +737,7 @@ st.caption(
 
 with st.container(border=True):
     st.markdown("**1. Escolha os ativos**")
-    c1, c2 = st.columns([3, 2])
+    c1, c2 = st.container(), st.container()  # busca em cima, atalhos embaixo (largura total)
     with c1:
         tipo = st.radio("Tipo", ["Fundo (CVM)", "Ação / ETF / FII / índice (Yahoo)"], horizontal=True)
         if tipo.startswith("Fundo"):
@@ -772,17 +772,34 @@ with st.container(border=True):
                 adicionar(f"yf:{t}", nome_padrao(f"yf:{t}"))
                 st.rerun()
     with c2:
-        st.write("Atalhos")
-        cols = st.columns(4)
-        for k, (rot, ident) in enumerate(ATALHOS):
-            if cols[k % 4].button(rot, key=f"at_{ident}"):
-                adicionar(ident, nome_padrao(ident))
-                st.rerun()
+        mapa_atalhos = dict(ATALHOS)
+        grupos = [
+            ("Brasil", ["CDI", "Selic", "IPCA", "IGP-M", "IPCA + 5%", "Dólar", "Ibovespa"]),
+            ("Exterior", ["S&P 500 TR", "MSCI World", "MSCI ACWI", "CPI + 5%"]),
+        ]
+        if hasattr(st, "pills"):  # botões compactos que mostram o nome inteiro
+            def _clicou_atalho(chave):
+                rot = st.session_state.get(chave)
+                if rot:
+                    adicionar(mapa_atalhos[rot], nome_padrao(mapa_atalhos[rot]))
+                    st.session_state[chave] = None
+
+            for titulo, rotulos_grupo in grupos:
+                st.pills(f"Atalhos · {titulo}", rotulos_grupo, key=f"pills_{titulo}",
+                         on_change=_clicou_atalho, args=(f"pills_{titulo}",))
+        else:  # versões antigas do Streamlit
+            for titulo, rotulos_grupo in grupos:
+                st.caption(f"Atalhos · {titulo}")
+                cols = st.columns(2)
+                for k, rot in enumerate(rotulos_grupo):
+                    if cols[k % 2].button(rot, key=f"at_{rot}", use_container_width=True):
+                        adicionar(mapa_atalhos[rot], nome_padrao(mapa_atalhos[rot]))
+                        st.rerun()
         with st.expander("Inflação + spread personalizado"):
-            e1, e2, e3 = st.columns([2, 2, 2])
+            e1, e2 = st.columns(2)
             base_inf = e1.selectbox("Inflação", ["IPCA", "CPI (EUA)"], key="inf_base")
             spread = e2.number_input("Spread (% a.a.)", value=5.0, step=0.5, key="inf_spread")
-            if e3.button("Adicionar", key="inf_add"):
+            if st.button("Adicionar", key="inf_add"):
                 ident = f"inf:{'ipca' if base_inf == 'IPCA' else 'cpi'}:{spread:g}"
                 adicionar(ident, nome_padrao(ident))
                 st.rerun()
