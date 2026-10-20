@@ -370,25 +370,48 @@ def buscar_fundos(termo: str, limite: int = 30) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────
 # Banco Central – SGS
 # ──────────────────────────────────────────────────────────────────────────
+def _sgs_bloco(codigo: str, nome: str, a: date, b: date) -> list:
+    """Uma consulta à API SGS, com até 3 tentativas (a API às vezes devolve página vazia ou HTML)."""
+    ultimo = ""
+    for tentativa in range(3):
+        if tentativa:
+            time.sleep(1.5 * tentativa)
+        try:
+            r = requests.get(
+                BCB_SGS.format(codigo=codigo),
+                params={"formato": "json", "dataInicial": f"{a:%d/%m/%Y}", "dataFinal": f"{b:%d/%m/%Y}"},
+                headers={**UA, "Accept": "application/json"}, timeout=45,
+            )
+        except requests.RequestException as e:
+            ultimo = type(e).__name__
+            continue
+        if r.status_code == 404:  # sem dados no intervalo
+            return []
+        if r.status_code != 200:
+            ultimo = f"erro {r.status_code}"
+            continue
+        try:
+            dados = r.json()
+        except ValueError:
+            ultimo = "resposta inválida"
+            continue
+        if isinstance(dados, list):
+            return dados
+        ultimo = str(dados)[:80]
+    if (b - a).days < 20:  # janela curtinha (ex.: só feriados): trata como sem dados
+        return []
+    raise ErroDados(f"Banco Central não respondeu para {nome} ({ultimo}).")
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def serie_bcb(codigo: str, inicio: date, fim: date) -> pd.DataFrame:
     nome, tipo = BCB[codigo]
     # mensal: pega o mês anterior também, para ter o ponto-base
     ini = (inicio.replace(day=1) - timedelta(days=1)).replace(day=1) if tipo == "taxa_mensal" else inicio
     partes, a = [], ini
-    while a <= fim:  # a API limita o tamanho da janela: busca em blocos de 5 anos
-        b = min(fim, a.replace(year=a.year + 5) - timedelta(days=1))
-        r = requests.get(
-            BCB_SGS.format(codigo=codigo),
-            params={"formato": "json", "dataInicial": f"{a:%d/%m/%Y}", "dataFinal": f"{b:%d/%m/%Y}"},
-            headers=UA, timeout=60,
-        )
-        if r.status_code == 404:  # sem dados no intervalo
-            a = b + timedelta(days=1)
-            continue
-        if r.status_code != 200:
-            raise ErroDados(f"Banco Central respondeu com erro {r.status_code} para {nome}.")
-        partes += r.json()
+    while a <= fim:  # a API limita o tamanho da janela: busca em blocos de 2 anos
+        b = min(fim, (pd.Timestamp(a) + pd.DateOffset(years=2) - pd.Timedelta(days=1)).date())
+        partes += _sgs_bloco(codigo, nome, a, b)
         a = b + timedelta(days=1)
     if not partes:
         return pd.DataFrame(columns=["valor"])
@@ -660,17 +683,28 @@ def _cpi_eua() -> tuple[str, pd.Series, list[str]]:
     raise ErroDados("CPI dos EUA indisponível agora (" + "; ".join(erros) + ").")
 
 
-def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tuple[str, pd.DataFrame]:
-    """Índice mensal (fim de mês) de inflação + spread % a.a."""
+DETALHES_INF: dict[str, dict] = {}
+
+
+def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tuple[str, pd.DataFrame, dict]:
+    """Índice mensal (fim de mês) de inflação + spread % a.a.
+
+    Ponto-base = último fim de mês ≤ início do período (ex.: período a partir de 20/10/2025 → base set/2025).
+    Cada mês M recebe a inflação de M e 1/12 do spread composto: (1 + spread)^(meses/12).
+    A série termina no último mês com inflação publicada (CPI sai ~dia 15 do mês seguinte; IPCA ~dia 10).
+    """
+    b = pd.offsets.MonthEnd().rollback(pd.Timestamp(inicio))
+    limite = pd.Timestamp(fim) + pd.offsets.MonthEnd(0)
     if base == "ipca":
         idx = serie_bcb("433", inicio, fim)["valor"]
-        fonte = "Banco Central (IPCA)"
+        fonte, nivel = "Banco Central (IPCA)", None
     else:
         fonte_cpi, cpi_total, erros = _cpi_eua()
         cpi_total = cpi_total.copy()
         cpi_total.index = cpi_total.index + pd.offsets.MonthEnd(0)  # CPI do mês M no fim de M
-        b = pd.offsets.MonthEnd().rollback(pd.Timestamp(inicio))
-        cpi = cpi_total[(cpi_total.index >= b) & (cpi_total.index <= pd.Timestamp(fim) + pd.offsets.MonthEnd(0))]
+        antes = cpi_total[cpi_total.index <= b]
+        base_pt = antes.index[-1] if len(antes) else cpi_total.index[0]
+        cpi = cpi_total[(cpi_total.index >= base_pt) & (cpi_total.index <= limite)]
         if len(cpi) < 2:
             raise ErroDados(
                 f"CPI sem dados para o período: a fonte disponível ({fonte_cpi}) vai só até "
@@ -678,11 +712,56 @@ def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tu
                 "Dica: cadastre uma chave grátis do FRED (FRED_API_KEY) nos Secrets do app."
             )
         idx = cpi / cpi.iloc[0]
-        fonte = f"CPI-U dos EUA via {fonte_cpi}"
+        fonte, nivel = f"CPI-U dos EUA via {fonte_cpi}", cpi
     # meses decorridos pela data (há meses sem CPI, ex.: out/2025, não publicado no shutdown dos EUA)
-    meses = (idx.index.year - idx.index[0].year) * 12 + (idx.index.month - idx.index[0].month)
-    out = idx.values * (1 + spread / 100) ** (np.asarray(meses) / 12)
-    return fonte, pd.DataFrame({"valor": out}, index=idx.index)
+    meses = np.asarray((idx.index.year - idx.index[0].year) * 12 + (idx.index.month - idx.index[0].month))
+    out = idx.values * (1 + spread / 100) ** (meses / 12)
+    faltando = [m.strftime("%m/%Y") for m in pd.date_range(idx.index[0], idx.index[-1], freq="ME")
+                if m not in idx.index]
+    detalhe = {
+        "Inflação": "IPCA" if base == "ipca" else "CPI-U (EUA, sem ajuste sazonal)",
+        "Fonte": fonte,
+        "Mês-base": f"{idx.index[0]:%m/%Y}" + (f" (índice {nivel.iloc[0]:,.3f})" if nivel is not None else ""),
+        "Último mês publicado": f"{idx.index[-1]:%m/%Y}" + (f" (índice {nivel.iloc[-1]:,.3f})" if nivel is not None else ""),
+        "Meses": int(meses[-1]),
+        "Inflação acumulada": float(idx.iloc[-1] - 1),
+        "Spread acumulado": float((1 + spread / 100) ** (meses[-1] / 12) - 1),
+        "Total (inflação + spread)": float(out[-1] - 1),
+        "Meses sem dado publicado": ", ".join(faltando) or "nenhum",
+    }
+    return fonte, pd.DataFrame({"valor": out}, index=idx.index), detalhe
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def serie_ptax(inicio: date, fim: date) -> pd.Series:
+    """Dólar PTAX venda (R$/US$): SGS do Banco Central → API PTAX (Olinda) do BC → Yahoo (BRL=X)."""
+    erros = []
+    try:
+        s = serie_bcb("1", inicio, fim)["valor"]
+        if len(s) > 1:
+            return s
+    except Exception as e:  # noqa: BLE001
+        erros.append(f"SGS: {e}")
+    try:
+        url = (
+            "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/"
+            "CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)"
+            f"?@dataInicial='{inicio:%m-%d-%Y}'&@dataFinalCotacao='{fim:%m-%d-%Y}'"
+            "&$top=100000&$format=json&$select=cotacaoVenda,dataHoraCotacao"
+        )
+        r = requests.get(url, headers=UA, timeout=45)
+        r.raise_for_status()
+        v = r.json()["value"]
+        s = pd.Series({pd.Timestamp(x["dataHoraCotacao"][:10]): float(x["cotacaoVenda"]) for x in v}).sort_index()
+        if len(s) > 1:
+            return s
+    except Exception as e:  # noqa: BLE001
+        erros.append(f"PTAX/Olinda: {type(e).__name__}")
+    try:
+        return _serie_yf("BRL=X", inicio, fim)
+    except Exception as e:  # noqa: BLE001
+        erros.append(f"Yahoo: {type(e).__name__}")
+    raise ErroDados("; ".join(erros))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -695,6 +774,8 @@ def moeda(ident: str) -> str:
         return INDICES[cod][1]
     if fonte == "yf":
         return "BRL" if cod.endswith(".SA") or cod == "^BVSP" else "USD"
+    if fonte == "inf":
+        return "USD" if cod.startswith("cpi") else "BRL"
     return "BRL"
 
 
@@ -729,7 +810,7 @@ def carregar(ident: str, inicio: date, fim: date) -> pd.DataFrame:
         return df
     if fonte == "inf":
         base, spread = cod.split(":")
-        FONTES_USADAS[ident], df = serie_inflacao_mais(base, float(spread), inicio, fim)
+        FONTES_USADAS[ident], df, DETALHES_INF[ident] = serie_inflacao_mais(base, float(spread), inicio, fim)
         return df
     raise ErroDados(f"Identificador desconhecido: {ident}")
 
@@ -834,6 +915,31 @@ def fmt_num(x, casas=1):
     if pd.isna(x):
         return "–"
     return f"{x:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def alinhar(ref: pd.Series, datas: pd.Index) -> pd.Series:
+    """Valor de `ref` em cada data (último disponível até a data)."""
+    return ref.reindex(ref.index.union(datas)).ffill().reindex(datas)
+
+
+def em_moeda(s: pd.Series, origem: str, destino: str, ptax: pd.Series | None) -> pd.Series | None:
+    if origem == destino:
+        return s
+    if ptax is None:
+        return None
+    cambio = alinhar(ptax, s.index)
+    return (s * cambio if destino == "BRL" else s / cambio).dropna()
+
+
+def retorno_janela(s: pd.Series, de: pd.Timestamp, ate: pd.Timestamp) -> tuple[float, pd.Timestamp | None, pd.Timestamp | None]:
+    """Retorno entre o último dado até `de` (fim do mês anterior ao 1º mês escolhido) e o último até `ate`."""
+    s = s.dropna()
+    antes = s[s.index <= de]
+    base = antes.index[-1] if len(antes) else (s.index[0] if len(s) else None)
+    final = s[s.index <= ate]
+    if base is None or not len(final) or final.index[-1] <= base:
+        return np.nan, None, None
+    return float(final.iloc[-1] / s.loc[base] - 1), base, final.index[-1]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -957,8 +1063,13 @@ ids = list(st.session_state.fi_ativos)
 if any(i.startswith("fi:") for i in ids):
     preparar_meses_cvm(inicio, fim)
 
-series, extras, falhas = {}, {}, []
+series, extras, nativas, falhas = {}, {}, {}, []
+ptax, erro_ptax = None, None  # dólar PTAX: usado na conversão do gráfico e na tabela R$ × US$
 with st.spinner("Buscando dados…"):
+    try:
+        ptax = serie_ptax(inicio - timedelta(days=45), fim)  # folga p/ o ponto-base de séries mensais
+    except Exception as e:  # noqa: BLE001
+        erro_ptax = str(e)
     for ident in ids:
         if not st.session_state.fi_ativos.get(ident):
             st.session_state.fi_ativos[ident] = nome_padrao(ident)
@@ -971,14 +1082,13 @@ with st.spinner("Buscando dados…"):
         if df.empty or df["valor"].dropna().empty:
             falhas.append(f"**{nome}**: sem dados no período.")
             continue
+        nativas[ident] = df["valor"].dropna()
         if em_reais and moeda(ident) == "USD":
-            try:
-                ptax = serie_bcb("1", inicio - timedelta(days=10), fim)["valor"]
-            except Exception as e:  # noqa: BLE001
-                falhas.append(f"**{nome}**: não consegui a PTAX para converter ({e}).")
+            if ptax is None:
+                falhas.append(f"**{nome}**: não consegui a PTAX para converter ({erro_ptax}).")
                 continue
             df = df.copy()
-            df["valor"] = df["valor"] * ptax.reindex(ptax.index.union(df.index)).ffill().reindex(df.index)
+            df["valor"] = df["valor"] * alinhar(ptax, df.index)
         series[ident] = df["valor"].dropna()
         extras[ident] = df
 
@@ -1021,9 +1131,79 @@ with aba_rent:
     st.markdown("**Retorno acumulado no período (%)**")
     st.line_chart(acum, height=420)
 
-    cols = st.columns(min(len(series), 4))
-    for k, (ident, s) in enumerate(series.items()):
-        cols[k % len(cols)].metric(nomes[ident], fmt_pct(s.iloc[-1] / s.iloc[0] - 1))
+    # ── Rentabilidade em R$ e em US$ nos meses escolhidos (independe do botão de conversão do gráfico)
+    st.markdown("**Rentabilidade em R\\$ e em US\\$ nos meses escolhidos**")
+    meses_periodo = list(pd.period_range(pd.Timestamp(inicio), pd.Timestamp(fim), freq="M"))
+    rot_mes = {m: f"{MESES[m.month - 1].lower()}/{m.year % 100:02d}" for m in meses_periodo}
+    if len(meses_periodo) > 1:
+        por_rot = {v: k for k, v in rot_mes.items()}
+        r_ini, r_fim = st.select_slider(
+            "Meses", options=list(por_rot), value=(rot_mes[meses_periodo[0]], rot_mes[meses_periodo[-1]]),
+            key="fi_janela",
+        )
+        m_ini, m_fim = por_rot[r_ini], por_rot[r_fim]
+    else:
+        m_ini = m_fim = meses_periodo[0]
+    visao = st.radio("Mostrar", ["Total do intervalo", "Mês a mês"], horizontal=True, key="fi_visao",
+                     label_visibility="collapsed")
+    de = (m_ini.to_timestamp() - pd.Timedelta(days=1)).normalize()   # fim do mês anterior
+    ate = m_fim.to_timestamp(how="end").normalize()
+
+    por_moeda = {}  # ident -> {"BRL": série, "USD": série}
+    for i, s_nat in nativas.items():
+        if i in series:
+            por_moeda[i] = {m: em_moeda(s_nat, moeda(i), m, ptax) for m in ("BRL", "USD")}
+    nome_base = {i: st.session_state.fi_ativos[i] for i in por_moeda}
+
+    if visao == "Total do intervalo":
+        linhas = {}
+        for i, d in por_moeda.items():
+            r_brl, b0, b1 = retorno_janela(d["BRL"], de, ate) if d["BRL"] is not None else (np.nan, None, None)
+            r_usd, u0, u1 = retorno_janela(d["USD"], de, ate) if d["USD"] is not None else (np.nan, None, None)
+            d0, d1 = (b0 or u0), (b1 or u1)
+            linhas[nome_base[i]] = {
+                "Em R$": r_brl, "Em US$": r_usd,
+                "De": f"{d0:%d/%m/%Y}" if d0 is not None else "–",
+                "Até": f"{d1:%d/%m/%Y}" if d1 is not None else "–",
+                "Moeda original": "R$" if moeda(i) == "BRL" else "US$",
+            }
+        tab_moeda = pd.DataFrame(linhas).T
+        st.dataframe(tab_moeda.style.format({"Em R$": fmt_pct, "Em US$": fmt_pct})
+                     .map(cor_retorno, subset=["Em R$", "Em US$"]))
+    else:
+        for m_rot, chave in (("Em R$", "BRL"), ("Em US$", "USD")):
+            mensal_m = {}
+            for i, d in por_moeda.items():
+                if d[chave] is None:
+                    continue
+                mensal_m[nome_base[i]] = {
+                    rot_mes[m]: retorno_janela(d[chave], (m.to_timestamp() - pd.Timedelta(days=1)).normalize(),
+                                               m.to_timestamp(how="end").normalize())[0]
+                    for m in meses_periodo if m_ini <= m <= m_fim
+                }
+            if mensal_m:
+                st.caption(m_rot.replace("$", "\\$"))
+                st.dataframe(pd.DataFrame(mensal_m).T.style.format(fmt_pct).map(cor_retorno))
+    if ptax is not None:
+        r_dolar = retorno_janela(ptax, de, ate)[0]
+        st.caption(
+            f"Dólar PTAX no intervalo: {fmt_pct(r_dolar)}. Ativos em US\\$ (S&P 500, MSCI, CPI + X%, ações dos EUA) "
+            "são convertidos para R\\$ pela PTAX, e ativos em R\\$ para US\\$ do mesmo jeito. "
+            "Meses incompletos usam o dado disponível mais recente (veja as colunas De/Até)."
+        )
+    else:
+        st.caption(f"Sem PTAX agora ({erro_ptax}): cada ativo aparece só na moeda original.")
+
+    infl = {nome_base[i]: d for i, d in DETALHES_INF.items() if i in series}
+    if infl:
+        with st.expander("Como o CPI/IPCA + X% é calculado (conferência)"):
+            st.dataframe(pd.DataFrame(infl).map(lambda v: fmt_pct(v) if isinstance(v, float) else str(v)))
+            st.caption(
+                "Índice = (inflação do mês-base até o último mês publicado) × (1 + spread)^(meses/12). "
+                "O mês-base é o último fim de mês antes do início do período. A série para no último mês com "
+                "inflação divulgada (CPI sai por volta do dia 15 do mês seguinte), então pode terminar antes dos "
+                "outros ativos."
+            )
 
     st.markdown("**Rentabilidade mês a mês**")
     por_nome = {nomes[i]: i for i in series}
