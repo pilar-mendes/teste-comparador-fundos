@@ -574,18 +574,29 @@ def _cpi_fred() -> pd.Series:
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def _cpi_eua() -> tuple[str, pd.Series]:
     """CPI-U dos EUA (sem ajuste sazonal), tentando 3 fontes e, por último, a cópia salva em disco."""
-    erros = []
-    for nome, func in (("DBnomics", _cpi_dbnomics), ("BLS", _cpi_bls), ("FRED", _cpi_fred)):
+    erros, candidatos = [], []
+    # O CPI de um mês sai por volta do dia 15 do mês seguinte: uma fonte em dia tem dado de até ~75 dias atrás.
+    em_dia = pd.Timestamp(date.today()) - pd.Timedelta(days=80)
+    for nome, func in (("BLS", _cpi_bls), ("FRED", _cpi_fred), ("DBnomics", _cpi_dbnomics)):
         try:
             s = func().dropna().sort_index()
-            if len(s) > 24:
-                s.to_frame("cpi").to_csv(CPI_DISCO)
-                return nome, s
         except Exception as e:  # noqa: BLE001
             erros.append(f"{nome}: {type(e).__name__}")
+            continue
+        if len(s) < 24:
+            erros.append(f"{nome}: poucos dados")
+            continue
+        if s.index[-1] >= em_dia:
+            s.to_frame("cpi").to_csv(CPI_DISCO)
+            return nome, s
+        erros.append(f"{nome}: desatualizado (último {s.index[-1]:%m/%Y})")
+        candidatos.append((s.index[-1], nome, s))
     if os.path.exists(CPI_DISCO):
-        s = pd.read_csv(CPI_DISCO, index_col=0, parse_dates=True)["cpi"]
-        return "cópia salva", s
+        s = pd.read_csv(CPI_DISCO, index_col=0, parse_dates=True)["cpi"].sort_index()
+        candidatos.append((s.index[-1], "cópia salva", s))
+    if candidatos:  # nenhuma fonte em dia: usa a mais recente que houver
+        _, nome, s = max(candidatos, key=lambda c: c[0])
+        return f"{nome} (último dado {s.index[-1]:%m/%Y})", s
     raise ErroDados("CPI dos EUA indisponível agora (" + "; ".join(erros) + "). Tente de novo em alguns minutos.")
 
 
@@ -595,12 +606,16 @@ def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tu
         idx = serie_bcb("433", inicio, fim)["valor"]
         fonte = "Banco Central (IPCA)"
     else:
-        fonte_cpi, cpi = _cpi_eua()
-        cpi.index = cpi.index + pd.offsets.MonthEnd(0)  # CPI do mês M no fim de M
+        fonte_cpi, cpi_total = _cpi_eua()
+        cpi_total = cpi_total.copy()
+        cpi_total.index = cpi_total.index + pd.offsets.MonthEnd(0)  # CPI do mês M no fim de M
         b = pd.offsets.MonthEnd().rollback(pd.Timestamp(inicio))
-        cpi = cpi[(cpi.index >= b) & (cpi.index <= pd.Timestamp(fim) + pd.offsets.MonthEnd(0))]
+        cpi = cpi_total[(cpi_total.index >= b) & (cpi_total.index <= pd.Timestamp(fim) + pd.offsets.MonthEnd(0))]
         if len(cpi) < 2:
-            raise ErroDados("CPI ainda sem dados para o período")
+            raise ErroDados(
+                f"CPI sem dados suficientes para o período (fonte: {fonte_cpi}; dados de "
+                f"{cpi_total.index[0]:%m/%Y} a {cpi_total.index[-1]:%m/%Y})."
+            )
         idx = cpi / cpi.iloc[0]
         fonte = f"CPI-U dos EUA via {fonte_cpi}"
     meses = np.arange(len(idx))
