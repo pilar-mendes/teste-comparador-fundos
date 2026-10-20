@@ -67,7 +67,8 @@ BCB = {
 }
 ATALHOS = [
     ("CDI", "bcb:12"), ("Selic", "bcb:11"), ("IPCA", "bcb:433"), ("IGP-M", "bcb:189"),
-    ("Dólar", "bcb:1"), ("Ibovespa", "yf:^BVSP"), ("S&P 500", "yf:^GSPC"),
+    ("Dólar", "bcb:1"), ("Ibovespa", "idx:ibov"), ("S&P 500 TR", "idx:sp500tr"), ("MSCI World", "idx:msciworld"),
+    ("MSCI ACWI", "idx:msciacwi"), ("CPI + 5%", "inf:cpi:5"), ("IPCA + 5%", "inf:ipca:5"),
 ]
 MESES = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
 
@@ -428,14 +429,151 @@ def serie_yahoo(ticker: str, inicio: date, fim: date) -> tuple[str, pd.DataFrame
 
     h = yf.Ticker(ticker).history(start=inicio, end=fim + timedelta(days=1), auto_adjust=True)
     if h is None or h.empty:
-        return ticker, pd.DataFrame(columns=["valor"])
+        raise ErroDados(f"Yahoo Finance não retornou dados para {ticker} (ticker errado ou limite de acesso; tente de novo em alguns minutos).")
     h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
     return ticker, h[["Close"]].rename(columns={"Close": "valor"})
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Ponto único de acesso:  "fi:<cnpj>" | "bcb:<código>" | "yf:<ticker>"
+# Índices de mercado (com fontes reserva) e inflação + spread
 # ──────────────────────────────────────────────────────────────────────────
+B3_INDICE = "https://sistemaswebb3-listados.b3.com.br/indexStatisticsProxy/IndexCall/GetPortfolioDay/{payload}"
+MSCI_URL = "https://app2.msci.com/products/service/index/indexmaster/getLevelDataForGraph"
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+# código -> (nome, moeda, [fontes em ordem de preferência])
+INDICES = {
+    "ibov": ("Ibovespa", "BRL", [("b3", "IBOV"), ("yf", "^BVSP"), ("yf", "BOVA11.SA")]),
+    "sp500tr": ("S&P 500 TR (USD)", "USD", [("yf", "^SP500TR"), ("yf", "SPY")]),
+    "msciworld": ("MSCI World NR (USD)", "USD", [("msci", "990100:NETR"), ("yf", "URTH")]),
+    "msciacwi": ("MSCI ACWI NR (USD)", "USD", [("msci", "892400:NETR"), ("yf", "ACWI")]),
+}
+NOME_FONTE = {"b3": "B3", "yf": "Yahoo Finance", "msci": "MSCI", "bcb": "Banco Central", "fred": "FRED (Fed St. Louis)"}
+FONTES_USADAS: dict[str, str] = {}
+
+
+def _num_br(v) -> float:
+    """'134.185,24' -> 134185.24 ; '134185.24' -> 134185.24"""
+    s = str(v or "").strip()
+    if not s:
+        return np.nan
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def _serie_b3(indice: str, inicio: date, fim: date) -> pd.Series:
+    import base64
+    import json
+
+    pontos = {}
+    for ano in range(inicio.year, fim.year + 1):
+        payload = base64.b64encode(
+            json.dumps({"index": indice, "language": "pt-br", "year": str(ano)}).encode()
+        ).decode()
+        r = requests.get(B3_INDICE.format(payload=payload), headers=UA, timeout=60)
+        r.raise_for_status()
+        for linha in (r.json() or {}).get("results") or []:
+            dia = int(linha.get("day") or 0)
+            for mes in range(1, 13):
+                v = _num_br(linha.get(f"rateValue{mes}"))
+                if dia and not np.isnan(v):
+                    try:
+                        pontos[pd.Timestamp(ano, mes, dia)] = v
+                    except ValueError:
+                        pass
+    if not pontos:
+        raise ErroDados("B3 não retornou dados")
+    return pd.Series(pontos).sort_index()
+
+
+def _serie_msci(codigo: str, inicio: date, fim: date) -> pd.Series:
+    cod, variante = codigo.split(":")
+    fim = min(fim, date.today() - timedelta(days=1))
+    r = requests.get(
+        MSCI_URL,
+        params={"currency_symbol": "USD", "index_variant": variante, "start_date": f"{inicio:%Y%m%d}",
+                "end_date": f"{fim:%Y%m%d}", "data_frequency": "DAILY", "index_codes": cod},
+        headers=UA, timeout=60,
+    )
+    r.raise_for_status()
+    niveis = r.json()["indexes"]["INDEX_LEVELS"]
+    s = pd.Series({pd.to_datetime(str(x["calc_date"]), format="%Y%m%d"): float(x["level_eod"]) for x in niveis})
+    if s.empty:
+        raise ErroDados("MSCI não retornou dados")
+    return s.sort_index()
+
+
+def _serie_yf(ticker: str, inicio: date, fim: date) -> pd.Series:
+    import yfinance as yf
+
+    h = yf.Ticker(ticker).history(start=inicio, end=fim + timedelta(days=1), auto_adjust=True)
+    if h is None or h.empty:
+        raise ErroDados(f"Yahoo sem dados para {ticker}")
+    h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
+    return h["Close"].dropna()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def serie_indice(codigo: str, inicio: date, fim: date) -> tuple[str, pd.DataFrame]:
+    """Tenta as fontes em ordem; devolve (fonte usada, DataFrame)."""
+    erros = []
+    for fonte, cod in INDICES[codigo][2]:
+        try:
+            s = {"b3": _serie_b3, "msci": _serie_msci, "yf": _serie_yf}[fonte](cod, inicio, fim)
+            s = s.loc[pd.Timestamp(inicio): pd.Timestamp(fim)]
+            if len(s) > 1:
+                rot = NOME_FONTE[fonte] + ("" if fonte != "yf" else f" ({cod})")
+                return rot, s.to_frame("valor")
+        except Exception as e:  # noqa: BLE001
+            erros.append(f"{NOME_FONTE[fonte]}: {type(e).__name__}")
+    raise ErroDados("nenhuma fonte respondeu (" + "; ".join(erros) + ")")
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def _cpi_eua() -> pd.Series:
+    r = requests.get(FRED_CSV, params={"id": "CPIAUCNS"}, headers=UA, timeout=60)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    s = pd.Series(pd.to_numeric(df.iloc[:, 1], errors="coerce").values, index=pd.to_datetime(df.iloc[:, 0]))
+    return s.dropna()
+
+
+def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tuple[str, pd.DataFrame]:
+    """Índice mensal (fim de mês) de inflação + spread % a.a."""
+    if base == "ipca":
+        idx = serie_bcb("433", inicio, fim)["valor"]
+        fonte = "Banco Central (IPCA)"
+    else:
+        cpi = _cpi_eua()
+        cpi.index = cpi.index + pd.offsets.MonthEnd(0)  # CPI do mês M no fim de M
+        b = pd.offsets.MonthEnd().rollback(pd.Timestamp(inicio))
+        cpi = cpi[(cpi.index >= b) & (cpi.index <= pd.Timestamp(fim) + pd.offsets.MonthEnd(0))]
+        if len(cpi) < 2:
+            raise ErroDados("CPI ainda sem dados para o período")
+        idx = cpi / cpi.iloc[0]
+        fonte = "FRED (CPI-U, sem ajuste sazonal)"
+    meses = np.arange(len(idx))
+    out = idx.values * (1 + spread / 100) ** (meses / 12)
+    return fonte, pd.DataFrame({"valor": out}, index=idx.index)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Ponto único de acesso:
+#   "fi:<cnpj>" | "bcb:<código>" | "yf:<ticker>" | "idx:<código>" | "inf:<ipca|cpi>:<spread>"
+# ──────────────────────────────────────────────────────────────────────────
+def moeda(ident: str) -> str:
+    fonte, cod = ident.split(":", 1)
+    if fonte == "idx":
+        return INDICES[cod][1]
+    if fonte == "yf":
+        return "BRL" if cod.endswith(".SA") or cod == "^BVSP" else "USD"
+    return "BRL"
+
+
 def nome_padrao(ident: str) -> str:
     fonte, cod = ident.split(":", 1)
     if fonte == "bcb":
@@ -443,17 +581,32 @@ def nome_padrao(ident: str) -> str:
     if fonte == "fi":
         cad = cadastro()
         return cad.at[cod, "nome"] if cod in cad.index else fmt_cnpj(cod)
+    if fonte == "idx":
+        return INDICES[cod][0]
+    if fonte == "inf":
+        base, spread = cod.split(":")
+        return f"{'IPCA' if base == 'ipca' else 'CPI (EUA)'} + {fmt_num(float(spread), 2).rstrip('0').rstrip(',')}%"
     return {"^BVSP": "Ibovespa", "^GSPC": "S&P 500"}.get(cod, cod.replace(".SA", ""))
 
 
 def carregar(ident: str, inicio: date, fim: date) -> pd.DataFrame:
     fonte, cod = ident.split(":", 1)
     if fonte == "fi":
+        FONTES_USADAS[ident] = "CVM"
         return serie_fundo(cod, inicio, fim)
     if fonte == "bcb":
+        FONTES_USADAS[ident] = "Banco Central"
         return serie_bcb(cod, inicio, fim)
     if fonte == "yf":
+        FONTES_USADAS[ident] = "Yahoo Finance"
         return serie_yahoo(cod, inicio, fim)[1]
+    if fonte == "idx":
+        FONTES_USADAS[ident], df = serie_indice(cod, inicio, fim)
+        return df
+    if fonte == "inf":
+        base, spread = cod.split(":")
+        FONTES_USADAS[ident], df = serie_inflacao_mais(base, float(spread), inicio, fim)
+        return df
     raise ErroDados(f"Identificador desconhecido: {ident}")
 
 
@@ -540,6 +693,15 @@ def tabela_calendario(s: pd.Series, bench: pd.Series | None) -> pd.DataFrame:
     return tab.sort_index(ascending=False)
 
 
+def cor_retorno(x) -> str:
+    """Verde para mês positivo, vermelho para negativo; intensidade até ±5% (sem matplotlib)."""
+    if pd.isna(x) or x == 0:
+        return ""
+    alfa = min(abs(float(x)) / 0.05, 1.0) * 0.55 + 0.08
+    rgb = "34, 160, 90" if x > 0 else "215, 60, 60"
+    return f"background-color: rgba({rgb}, {alfa:.2f})"
+
+
 def fmt_pct(x):
     return "–" if pd.isna(x) else f"{x:.2%}".replace(".", ",")
 
@@ -614,7 +776,15 @@ with st.container(border=True):
         cols = st.columns(4)
         for k, (rot, ident) in enumerate(ATALHOS):
             if cols[k % 4].button(rot, key=f"at_{ident}"):
-                adicionar(ident, rot)
+                adicionar(ident, nome_padrao(ident))
+                st.rerun()
+        with st.expander("Inflação + spread personalizado"):
+            e1, e2, e3 = st.columns([2, 2, 2])
+            base_inf = e1.selectbox("Inflação", ["IPCA", "CPI (EUA)"], key="inf_base")
+            spread = e2.number_input("Spread (% a.a.)", value=5.0, step=0.5, key="inf_spread")
+            if e3.button("Adicionar", key="inf_add"):
+                ident = f"inf:{'ipca' if base_inf == 'IPCA' else 'cpi'}:{spread:g}"
+                adicionar(ident, nome_padrao(ident))
                 st.rerun()
     lugar_selecionados = st.container()
 
@@ -635,6 +805,11 @@ else:
     inicio, fim = (pd.Timestamp(hoje) - pd.DateOffset(months=int(janela.split()[0]))).date(), hoje
 if janela != "Personalizado":
     c2.text_input("De / até", f"{inicio:%d/%m/%Y} – {fim:%d/%m/%Y}", disabled=True)
+tem_usd = any(moeda(i) == "USD" for i in st.session_state.fi_ativos)
+em_reais = st.toggle(
+    "Converter ativos em dólar para reais (PTAX)", value=False, disabled=not tem_usd,
+    help="S&P 500 TR, MSCI e ações dos EUA são cotados em USD. Ligue para comparar com fundos em R$ sem hedge.",
+)
 
 # Download -------------------------------------------------------------------
 ids = list(st.session_state.fi_ativos)
@@ -655,6 +830,14 @@ with st.spinner("Buscando dados…"):
         if df.empty or df["valor"].dropna().empty:
             falhas.append(f"**{nome}**: sem dados no período.")
             continue
+        if em_reais and moeda(ident) == "USD":
+            try:
+                ptax = serie_bcb("1", inicio - timedelta(days=10), fim)["valor"]
+            except Exception as e:  # noqa: BLE001
+                falhas.append(f"**{nome}**: não consegui a PTAX para converter ({e}).")
+                continue
+            df = df.copy()
+            df["valor"] = df["valor"] * ptax.reindex(ptax.index.union(df.index)).ffill().reindex(df.index)
         series[ident] = df["valor"].dropna()
         extras[ident] = df
 
@@ -675,7 +858,11 @@ for f in falhas:
 if not series:
     st.stop()
 
-nomes = {i: st.session_state.fi_ativos[i] for i in series}
+nomes = {
+    i: st.session_state.fi_ativos[i].replace("(USD)", "(R$)") + ("" if "(USD)" in st.session_state.fi_ativos[i] else " em R$")
+    if em_reais and moeda(i) == "USD" else st.session_state.fi_ativos[i]
+    for i in series
+}
 rotulos_bench = {"Nenhum": None, **{nomes[i]: i for i in series}}
 padrao = next((k for k, v in enumerate(rotulos_bench.values()) if v == "bcb:12"), 0)
 bench_id = rotulos_bench[c3.selectbox("Benchmark (para % do bench. e Sharpe)", list(rotulos_bench), index=padrao)]
@@ -702,8 +889,7 @@ with aba_rent:
     alvo = por_nome[st.selectbox("Ativo", list(por_nome), key="fi_cal")]
     cal = tabela_calendario(series[alvo], bench if alvo != bench_id else None)
     if not cal.empty:
-        st.dataframe(cal.style.format(fmt_pct).background_gradient(
-            cmap="RdYlGn", subset=MESES, vmin=-0.05, vmax=0.05, axis=None))
+        st.dataframe(cal.style.format(fmt_pct).map(cor_retorno, subset=MESES))
 
 with aba_comp:
     tab = pd.DataFrame({nomes[i]: metricas(series[i], bench if i != bench_id else None, extras[i]) for i in series}).T
@@ -743,6 +929,7 @@ with aba_dados:
     bruto = painel.copy()
     bruto.columns = [nomes[c] for c in bruto.columns]
     st.dataframe(bruto.tail(30))
+    st.caption("Fontes: " + " · ".join(f"{nomes[i]}: {FONTES_USADAS.get(i, '–')}" for i in series))
     st.download_button(
         "Baixar séries (CSV)",
         bruto.to_csv(sep=";", decimal=",").encode("utf-8-sig"),
