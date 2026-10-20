@@ -536,28 +536,61 @@ def serie_indice(codigo: str, inicio: date, fim: date) -> tuple[str, pd.DataFram
 CPI_DISCO = os.path.join(PASTA, "cpi_eua.csv")
 
 
-def _cpi_dbnomics() -> pd.Series:
-    r = requests.get("https://api.db.nomics.world/v22/series/BLS/cu/CUUR0000SA0",
-                     params={"observations": 1}, headers=UA, timeout=25)
+def _segredo(nome: str) -> str | None:
+    try:
+        v = st.secrets.get(nome)
+    except Exception:  # sem secrets configurados
+        v = None
+    return v or os.environ.get(nome)
+
+
+def _cpi_oecd() -> pd.Series:
+    """OECD (SDMX, sem chave): CPI total dos EUA, índice, sem ajuste sazonal."""
+    ini = date.today().year - 20
+    url = ("https://sdmx.oecd.org/public/rest/data/OECD.SDD.TPS,DSD_PRICES@DF_PRICES_ALL,1.0/"
+           "USA.M.N.CPI..._T.N.")
+    r = requests.get(url, params={"startPeriod": f"{ini}-01", "format": "csvfile"}, headers=UA, timeout=25)
     r.raise_for_status()
-    doc = r.json()["series"]["docs"][0]
-    return pd.Series(pd.to_numeric(pd.Series(doc["value"]), errors="coerce").values,
-                     index=pd.to_datetime(doc["period"], format="%Y-%m"))
+    df = pd.read_csv(io.StringIO(r.text), dtype=str)
+    for coluna, valor in (("UNIT_MEASURE", "IX"), ("TRANSFORMATION", "_Z"), ("ADJUSTMENT", "N"),
+                          ("METHODOLOGY", "N"), ("EXPENDITURE", "_T")):
+        if coluna in df and (df[coluna] == valor).any():
+            df = df[df[coluna] == valor]
+    if "BASE_PER" in df and df["BASE_PER"].nunique() > 1:  # se houver mais de uma base, fica com a mais longa
+        df = df[df["BASE_PER"] == df["BASE_PER"].value_counts().idxmax()]
+    return pd.Series(pd.to_numeric(df["OBS_VALUE"], errors="coerce").values,
+                     index=pd.to_datetime(df["TIME_PERIOD"], format="%Y-%m"))
+
+
+def _cpi_fred_api() -> pd.Series:
+    """API oficial do FRED (precisa de chave grátis em FRED_API_KEY nos Secrets)."""
+    chave = _segredo("FRED_API_KEY")
+    if not chave:
+        raise ErroDados("sem chave")
+    r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                     params={"series_id": "CPIAUCNS", "api_key": chave, "file_type": "json",
+                             "observation_start": f"{date.today().year - 20}-01-01"},
+                     headers=UA, timeout=25)
+    r.raise_for_status()
+    obs = r.json()["observations"]
+    return pd.Series({pd.Timestamp(o["date"]): _num_br(o["value"]) for o in obs if o["value"] != "."})
 
 
 def _cpi_bls() -> pd.Series:
-    """API pública do BLS (v1, sem chave): no máximo 10 anos por consulta."""
+    """API pública do BLS. Sem chave (v1): 10 anos por consulta e limite diário por IP.
+    Com chave grátis em BLS_API_KEY (v2): limite bem maior."""
+    chave = _segredo("BLS_API_KEY")
+    url = "https://api.bls.gov/publicAPI/v2/timeseries/data/" if chave else "https://api.bls.gov/publicAPI/v1/timeseries/data/"
     pontos, fim = {}, date.today().year
     for ini in (fim - 19, fim - 9):
-        r = requests.post(
-            "https://api.bls.gov/publicAPI/v1/timeseries/data/",
-            json={"seriesid": ["CUUR0000SA0"], "startyear": str(ini), "endyear": str(ini + 9)},
-            headers={**UA, "Content-Type": "application/json"}, timeout=25,
-        )
+        corpo = {"seriesid": ["CUUR0000SA0"], "startyear": str(ini), "endyear": str(ini + 9)}
+        if chave:
+            corpo["registrationkey"] = chave
+        r = requests.post(url, json=corpo, headers={**UA, "Content-Type": "application/json"}, timeout=25)
         r.raise_for_status()
         j = r.json()
         if j.get("status") != "REQUEST_SUCCEEDED":
-            raise ErroDados("BLS: " + "; ".join(j.get("message", [])))
+            raise ErroDados("; ".join(j.get("message", [])) or "recusado")
         for x in j["Results"]["series"][0]["data"]:
             if x["period"].startswith("M") and x["period"] != "M13":
                 pontos[pd.Timestamp(int(x["year"]), int(x["period"][1:]), 1)] = _num_br(x["value"])
@@ -565,30 +598,57 @@ def _cpi_bls() -> pd.Series:
 
 
 def _cpi_fred() -> pd.Series:
-    r = requests.get(FRED_CSV, params={"id": "CPIAUCNS"}, headers=UA, timeout=25)
+    r = requests.get(FRED_CSV, params={"id": "CPIAUCNS"}, headers=UA, timeout=20)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     return pd.Series(pd.to_numeric(df.iloc[:, 1], errors="coerce").values, index=pd.to_datetime(df.iloc[:, 0]))
 
 
-@st.cache_data(ttl=12 * 3600, show_spinner=False)
-def _cpi_eua() -> tuple[str, pd.Series]:
-    """CPI-U dos EUA (sem ajuste sazonal), tentando 3 fontes e, por último, a cópia salva em disco."""
+def _cpi_dbnomics() -> pd.Series:
+    r = requests.get("https://api.db.nomics.world/v22/series/BLS/cu/CUUR0000SA0",
+                     params={"observations": 1}, headers=UA, timeout=20)
+    r.raise_for_status()
+    doc = r.json()["series"]["docs"][0]
+    return pd.Series(pd.to_numeric(pd.Series(doc["value"]), errors="coerce").values,
+                     index=pd.to_datetime(doc["period"], format="%Y-%m"))
+
+
+FONTES_CPI = (("FRED (API)", _cpi_fred_api), ("BLS", _cpi_bls), ("OECD", _cpi_oecd),
+              ("FRED", _cpi_fred), ("DBnomics", _cpi_dbnomics))
+
+
+@st.cache_resource(show_spinner=False)
+def _memoria_cpi() -> dict:
+    """Guarda, por fonte, o último resultado (sucesso ou falha) para não repetir consultas lentas."""
+    return {}
+
+
+def _cpi_eua() -> tuple[str, pd.Series, list[str]]:
+    """CPI-U dos EUA (sem ajuste sazonal). Tenta várias fontes; usa a primeira que estiver em dia.
+    Sucesso fica guardado por 12 h; falha, por 30 min."""
+    memoria, agora = _memoria_cpi(), time.time()
+    em_dia = pd.Timestamp(date.today()) - pd.Timedelta(days=80)  # CPI sai ~15 dias após o fim do mês
     erros, candidatos = [], []
-    # O CPI de um mês sai por volta do dia 15 do mês seguinte: uma fonte em dia tem dado de até ~75 dias atrás.
-    em_dia = pd.Timestamp(date.today()) - pd.Timedelta(days=80)
-    for nome, func in (("BLS", _cpi_bls), ("FRED", _cpi_fred), ("DBnomics", _cpi_dbnomics)):
-        try:
-            s = func().dropna().sort_index()
-        except Exception as e:  # noqa: BLE001
-            erros.append(f"{nome}: {type(e).__name__}")
-            continue
-        if len(s) < 24:
-            erros.append(f"{nome}: poucos dados")
+    for nome, func in FONTES_CPI:
+        quando, s, erro = memoria.get(nome, (0, None, None))
+        validade = 12 * 3600 if s is not None else 30 * 60
+        if agora - quando > validade:
+            try:
+                s, erro = func().dropna().sort_index(), None
+                if len(s) < 24:
+                    s, erro = None, "poucos dados"
+            except Exception as e:  # noqa: BLE001
+                s, erro = None, (str(e)[:80] if isinstance(e, ErroDados) else type(e).__name__)
+            memoria[nome] = (agora, s, erro)
+        if s is None:
+            erros.append(f"{nome}: {erro}")
             continue
         if s.index[-1] >= em_dia:
-            s.to_frame("cpi").to_csv(CPI_DISCO)
-            return nome, s
+            try:
+                s.to_frame("cpi").to_csv(CPI_DISCO)
+            except OSError:
+                pass
+            return nome, s, erros
         erros.append(f"{nome}: desatualizado (último {s.index[-1]:%m/%Y})")
         candidatos.append((s.index[-1], nome, s))
     if os.path.exists(CPI_DISCO):
@@ -596,8 +656,8 @@ def _cpi_eua() -> tuple[str, pd.Series]:
         candidatos.append((s.index[-1], "cópia salva", s))
     if candidatos:  # nenhuma fonte em dia: usa a mais recente que houver
         _, nome, s = max(candidatos, key=lambda c: c[0])
-        return f"{nome} (último dado {s.index[-1]:%m/%Y})", s
-    raise ErroDados("CPI dos EUA indisponível agora (" + "; ".join(erros) + "). Tente de novo em alguns minutos.")
+        return f"{nome} (último dado {s.index[-1]:%m/%Y})", s, erros
+    raise ErroDados("CPI dos EUA indisponível agora (" + "; ".join(erros) + ").")
 
 
 def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tuple[str, pd.DataFrame]:
@@ -606,20 +666,22 @@ def serie_inflacao_mais(base: str, spread: float, inicio: date, fim: date) -> tu
         idx = serie_bcb("433", inicio, fim)["valor"]
         fonte = "Banco Central (IPCA)"
     else:
-        fonte_cpi, cpi_total = _cpi_eua()
+        fonte_cpi, cpi_total, erros = _cpi_eua()
         cpi_total = cpi_total.copy()
         cpi_total.index = cpi_total.index + pd.offsets.MonthEnd(0)  # CPI do mês M no fim de M
         b = pd.offsets.MonthEnd().rollback(pd.Timestamp(inicio))
         cpi = cpi_total[(cpi_total.index >= b) & (cpi_total.index <= pd.Timestamp(fim) + pd.offsets.MonthEnd(0))]
         if len(cpi) < 2:
             raise ErroDados(
-                f"CPI sem dados suficientes para o período (fonte: {fonte_cpi}; dados de "
-                f"{cpi_total.index[0]:%m/%Y} a {cpi_total.index[-1]:%m/%Y})."
+                f"CPI sem dados para o período: a fonte disponível ({fonte_cpi}) vai só até "
+                f"{cpi_total.index[-1]:%m/%Y}. Outras fontes: " + "; ".join(erros) + ". "
+                "Dica: cadastre uma chave grátis do FRED (FRED_API_KEY) nos Secrets do app."
             )
         idx = cpi / cpi.iloc[0]
         fonte = f"CPI-U dos EUA via {fonte_cpi}"
-    meses = np.arange(len(idx))
-    out = idx.values * (1 + spread / 100) ** (meses / 12)
+    # meses decorridos pela data (há meses sem CPI, ex.: out/2025, não publicado no shutdown dos EUA)
+    meses = (idx.index.year - idx.index[0].year) * 12 + (idx.index.month - idx.index[0].month)
+    out = idx.values * (1 + spread / 100) ** (np.asarray(meses) / 12)
     return fonte, pd.DataFrame({"valor": out}, index=idx.index)
 
 
