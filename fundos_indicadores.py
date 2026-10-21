@@ -421,9 +421,13 @@ def serie_bcb(codigo: str, inicio: date, fim: date) -> pd.DataFrame:
     s = s.dropna().drop_duplicates("data").set_index("data")["v"].sort_index()
 
     if tipo == "taxa_diaria":
+        # base 1 no próprio dia de início; acumula as taxas dos dias seguintes
+        # (convenção de mercado: CDI "no ano" começa a render em 02/01, com base em 31/12)
+        s = s[s.index > pd.Timestamp(inicio)]
+        if s.empty:
+            return pd.DataFrame(columns=["valor"])
         indice = (1 + s / 100).cumprod()
-        # base 1 no dia anterior ao primeiro dado (o 1º dia já rende)
-        indice = pd.concat([pd.Series([1.0], index=[indice.index[0] - pd.Timedelta(days=1)]), indice])
+        indice = pd.concat([pd.Series([1.0], index=[pd.Timestamp(inicio)]), indice])
     elif tipo == "taxa_mensal":
         # taxa do mês M fica registrada no fim do mês M; base 1 no fim do mês anterior
         s.index = s.index + pd.offsets.MonthEnd(0)
@@ -446,15 +450,61 @@ def ticker_yahoo(t: str) -> str:
     return t
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def serie_yahoo(ticker: str, inicio: date, fim: date) -> tuple[str, pd.DataFrame]:
-    import yfinance as yf
+def _yahoo_direto(ticker: str, inicio: date, fim: date) -> pd.Series:
+    """Fechamento ajustado (com proventos) direto da API de gráficos do Yahoo, sem a biblioteca yfinance."""
+    p1 = int(pd.Timestamp(inicio).timestamp())
+    p2 = int((pd.Timestamp(fim) + pd.Timedelta(days=1)).timestamp())
+    ultimo = ""
+    for host in ("query1", "query2"):
+        try:
+            r = requests.get(
+                f"https://{host}.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(ticker)}",
+                params={"period1": p1, "period2": p2, "interval": "1d", "events": "div,splits",
+                        "includeAdjustedClose": "true"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            ts = pd.to_datetime(np.asarray(res["timestamp"]) + res["meta"].get("gmtoffset", 0), unit="s").normalize()
+            ind = res["indicators"]
+            valores = (ind.get("adjclose") or [{}])[0].get("adjclose") or ind["quote"][0]["close"]
+            s = pd.Series(pd.to_numeric(pd.Series(valores), errors="coerce").values, index=ts)
+            s = s[~s.index.duplicated(keep="last")].dropna()
+            if len(s):
+                return s
+            ultimo = "sem dados"
+        except Exception as e:  # noqa: BLE001
+            ultimo = type(e).__name__
+    raise ErroDados(f"Yahoo direto: {ultimo}")
 
+
+def _serie_yf(ticker: str, inicio: date, fim: date) -> pd.Series:
+    """Yahoo: tenta a API direta; se falhar e a biblioteca yfinance estiver instalada, usa ela."""
+    try:
+        return _yahoo_direto(ticker, inicio, fim).loc[pd.Timestamp(inicio): pd.Timestamp(fim)]
+    except ErroDados as e:
+        erro_direto = str(e)
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise ErroDados(erro_direto) from None
     h = yf.Ticker(ticker).history(start=inicio, end=fim + timedelta(days=1), auto_adjust=True)
     if h is None or h.empty:
-        raise ErroDados(f"Yahoo Finance não retornou dados para {ticker} (ticker errado ou limite de acesso; tente de novo em alguns minutos).")
+        raise ErroDados(f"{erro_direto}; yfinance sem dados para {ticker}")
     h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
-    return ticker, h[["Close"]].rename(columns={"Close": "valor"})
+    return h["Close"].dropna()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def serie_yahoo(ticker: str, inicio: date, fim: date) -> tuple[str, pd.DataFrame]:
+    try:
+        s = _serie_yf(ticker, inicio, fim)
+    except ErroDados as e:
+        raise ErroDados(f"Yahoo Finance não retornou dados para {ticker} ({e}). "
+                        "Confira o ticker ou tente de novo em alguns minutos.") from None
+    return ticker, s.to_frame("valor")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -467,7 +517,7 @@ FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 # código -> (nome, moeda, [fontes em ordem de preferência])
 INDICES = {
     "ibov": ("Ibovespa", "BRL", [("b3", "IBOV"), ("yf", "^BVSP"), ("yf", "BOVA11.SA")]),
-    "sp500tr": ("S&P 500 TR (USD)", "USD", [("yf", "^SP500TR"), ("yf", "SPY")]),
+    "sp500tr": ("S&P 500 TR (USD)", "USD", [("yf", "^SP500TR"), ("yf", "SPY"), ("yf", "IVV")]),
     "msciworld": ("MSCI World NR (USD)", "USD", [("msci", "990100:NETR"), ("yf", "URTH")]),
     "msciacwi": ("MSCI ACWI NR (USD)", "USD", [("msci", "892400:NETR"), ("yf", "ACWI")]),
 }
@@ -530,14 +580,6 @@ def _serie_msci(codigo: str, inicio: date, fim: date) -> pd.Series:
     return s.sort_index()
 
 
-def _serie_yf(ticker: str, inicio: date, fim: date) -> pd.Series:
-    import yfinance as yf
-
-    h = yf.Ticker(ticker).history(start=inicio, end=fim + timedelta(days=1), auto_adjust=True)
-    if h is None or h.empty:
-        raise ErroDados(f"Yahoo sem dados para {ticker}")
-    h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
-    return h["Close"].dropna()
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -552,7 +594,8 @@ def serie_indice(codigo: str, inicio: date, fim: date) -> tuple[str, pd.DataFram
                 rot = NOME_FONTE[fonte] + ("" if fonte != "yf" else f" ({cod})")
                 return rot, s.to_frame("valor")
         except Exception as e:  # noqa: BLE001
-            erros.append(f"{NOME_FONTE[fonte]}: {type(e).__name__}")
+            msg = str(e)[:60] if isinstance(e, ErroDados) else type(e).__name__
+            erros.append(f"{NOME_FONTE[fonte]} ({cod}): {msg}")
     raise ErroDados("nenhuma fonte respondeu (" + "; ".join(erros) + ")")
 
 
@@ -1042,12 +1085,16 @@ if not st.session_state.fi_ativos:
 # Período --------------------------------------------------------------------
 hoje = date.today()
 c1, c2, c3 = st.columns([2, 2, 3])
-janela = c1.selectbox("Período", ["12 meses", "No ano", "24 meses", "36 meses", "60 meses", "Personalizado"])
+INICIO_GESTAO = date(2021, 12, 31)  # início da gestão
+ROTULO_GESTAO = f"Desde o início da gestão ({INICIO_GESTAO:%d/%m/%Y})"
+janela = c1.selectbox("Período", ["12 meses", "No ano", "24 meses", "36 meses", "60 meses", ROTULO_GESTAO, "Personalizado"])
 if janela == "Personalizado":
     datas = c2.date_input("De / até", value=(hoje - timedelta(days=365), hoje), format="DD/MM/YYYY")
     inicio, fim = (datas if len(datas) == 2 else (datas[0], hoje))
 elif janela == "No ano":
     inicio, fim = date(hoje.year - 1, 12, 31), hoje
+elif janela == ROTULO_GESTAO:
+    inicio, fim = INICIO_GESTAO, hoje
 else:
     inicio, fim = (pd.Timestamp(hoje) - pd.DateOffset(months=int(janela.split()[0]))).date(), hoje
 if janela != "Personalizado":
@@ -1133,13 +1180,14 @@ with aba_rent:
 
     # ── Rentabilidade em R$ e em US$ nos meses escolhidos (independe do botão de conversão do gráfico)
     st.markdown("**Rentabilidade em R\\$ e em US\\$ nos meses escolhidos**")
-    meses_periodo = list(pd.period_range(pd.Timestamp(inicio), pd.Timestamp(fim), freq="M"))
+    # o 1º mês é o do dia seguinte ao início (ex.: início 31/12/2021 → primeiro mês jan/22)
+    meses_periodo = list(pd.period_range(pd.Timestamp(inicio) + pd.Timedelta(days=1), pd.Timestamp(fim), freq="M"))
     rot_mes = {m: f"{MESES[m.month - 1].lower()}/{m.year % 100:02d}" for m in meses_periodo}
     if len(meses_periodo) > 1:
         por_rot = {v: k for k, v in rot_mes.items()}
         r_ini, r_fim = st.select_slider(
             "Meses", options=list(por_rot), value=(rot_mes[meses_periodo[0]], rot_mes[meses_periodo[-1]]),
-            key="fi_janela",
+            key=f"fi_janela_{inicio:%Y%m%d}_{fim:%Y%m%d}",  # muda o período → volta a mostrar tudo
         )
         m_ini, m_fim = por_rot[r_ini], por_rot[r_fim]
     else:
