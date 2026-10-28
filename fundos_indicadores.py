@@ -946,8 +946,27 @@ def cor_retorno(x) -> str:
     if pd.isna(x) or x == 0:
         return ""
     alfa = min(abs(float(x)) / 0.05, 1.0) * 0.55 + 0.08
-    rgb = "34, 160, 90" if x > 0 else "215, 60, 60"
+    rgb = "85, 186, 168" if x > 0 else "215, 80, 80"  # verde da marca / vermelho suave
     return f"background-color: rgba({rgb}, {alfa:.2f})"
+
+
+def tabela(df: pd.DataFrame, formatos=None, colorir=None):
+    """Formata como texto (vazios viram "–") e pinta os retornos pelas cores da marca.
+
+    formatos: função única ou {coluna: função}; colorir: colunas (ou True = todas) com cor por sinal.
+    """
+    num = df.copy()
+    txt = df.copy().astype(object)
+    for c in df.columns:
+        f = formatos.get(c) if isinstance(formatos, dict) else formatos
+        txt[c] = [("–" if (v is None or (isinstance(v, float) and np.isnan(v))) else (f(v) if f else str(v)))
+                  for v in df[c]]
+    est = txt.style
+    if colorir:
+        cols = list(df.columns) if colorir is True else [c for c in colorir if c in df.columns]
+        est = est.apply(lambda _: num[cols].apply(lambda col: col.map(
+            lambda v: cor_retorno(v) if isinstance(v, (int, float, np.floating)) else "")), axis=None, subset=cols)
+    return est
 
 
 def fmt_pct(x):
@@ -986,6 +1005,120 @@ def retorno_janela(s: pd.Series, de: pd.Timestamp, ate: pd.Timestamp) -> tuple[f
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Identidade visual Nextep (manual da marca): azul, verde, cinza auxiliar e fonte Lato
+# ──────────────────────────────────────────────────────────────────────────
+AZUL, VERDE, CINZA = "#223D5E", "#55BAA8", "#535B61"
+AZUL_CLARO = "#2C4C73"  # um tom acima do azul institucional, para caixas sobre fundo azul
+PALETAS = {
+    # ordem das linhas nos gráficos (o 1º ativo escolhido recebe a 1ª cor): as 2 primeiras são da marca,
+    # as demais são cores bem diferentes entre si para facilitar a leitura com muitos ativos
+    "branco": [AZUL, VERDE, "#E4572E", "#E0A100", "#7B61FF", "#17A2D8", "#D63384", "#8C6D46", CINZA, "#2E8B57"],
+    "azul": [VERDE, "#FFFFFF", "#FF6B6B", "#FFD166", "#4CC9F0", "#C77DFF", "#FF9F1C", "#F78FB3", "#B8C1C8", "#90EE90"],
+}
+
+
+def aplicar_tema(fundo: str):
+    """CSS da página: fonte Lato, cores da marca e fundo branco ou azul.
+
+    No fundo azul, os campos (listas, caixas de texto, tabelas) continuam claros, como cartões sobre o azul;
+    só os textos que ficam direto sobre o fundo viram brancos.
+    """
+    css = f"""
+    @import url('https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,300;0,400;0,700;0,900;1,400&display=swap');
+    .stApp, .stApp p, .stApp label, .stApp li, .stApp input, .stApp textarea, .stApp button,
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+    .stApp span:not([data-testid="stIconMaterial"]):not([class*="material"]) {{
+        font-family: 'Lato', sans-serif !important;
+    }}
+    .stApp h1 {{ font-weight: 700 !important; letter-spacing: .3px; }}
+    /* seleções na cor verde da marca (versões novas e antigas do Streamlit) */
+    .stApp span[data-tag], .stApp [data-baseweb="tag"] {{ background-color: {VERDE} !important; }}
+    .stApp span[data-tag] *, .stApp [data-baseweb="tag"] * {{ color: #FFFFFF !important; }}
+    .stApp button[data-variant="pills"][aria-checked="true"],
+    .stApp button[data-variant="segmented_control"][aria-checked="true"] {{
+        background-color: {VERDE} !important; border-color: {VERDE} !important;
+    }}
+    .stApp button[data-variant="pills"][aria-checked="true"] *,
+    .stApp button[data-variant="segmented_control"][aria-checked="true"] * {{ color: #FFFFFF !important; }}
+    .stApp button[data-variant="segmented_control"], .stApp button[data-variant="pills"] {{ color: {AZUL}; }}
+    .stApp [data-baseweb="tab-highlight"], .stApp [role="tab"][aria-selected="true"]::after {{ background-color: {VERDE} !important; }}
+    .stApp [data-testid="stSliderThumbValue"] p {{ color: {VERDE} !important; }}
+    .stApp [data-testid="stDataFrame"] {{ border-radius: 8px; overflow: hidden; }}
+    """
+    if fundo == "azul":
+        css += f"""
+        .stApp, [data-testid="stHeader"], [data-testid="stBottomBlockContainer"] {{ background-color: {AZUL} !important; }}
+        [data-testid="stHeader"] * {{ color: #FFFFFF !important; }}
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+        .stApp [data-testid="stMarkdown"] p, .stApp [data-testid="stMarkdown"] strong, .stApp [data-testid="stMarkdown"] li,
+        .stApp [data-testid="stWidgetLabel"] p, .stApp [data-testid="stRadioOption"] p,
+        .stApp [data-testid="stCheckbox"] p, .stApp label[data-baseweb="checkbox"] p,
+        .stApp [role="tab"] p, .stApp [data-baseweb="tab"] p,
+        .stApp [data-testid="stExpander"] summary p, .stApp [data-testid="stExpander"] summary span,
+        .stApp [data-testid="stSliderTickBarMin"], .stApp [data-testid="stSliderTickBarMax"],
+        .stApp [data-testid="stTooltipIcon"] * {{
+            color: #FFFFFF !important;
+        }}
+        .stApp [data-testid="stExpander"] summary svg {{ fill: #FFFFFF !important; color: #FFFFFF !important; }}
+        .stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] * {{
+            color: rgba(255,255,255,.75) !important;
+        }}
+        .stApp [data-testid="stVerticalBlockBorderWrapper"], .stApp [data-testid="stExpander"] details {{
+            border-color: rgba(255,255,255,.25) !important;
+        }}
+        .stApp [data-testid="stExpander"] details {{ background: transparent !important; }}
+        .stApp [data-testid="stExpanderDetails"] {{ background: transparent !important; }}
+        .stApp [data-baseweb="tab-border"], .stApp [role="tablist"] {{ border-color: rgba(255,255,255,.2) !important; }}
+        /* botões comuns sobre o azul: contorno branco */
+        .stApp button[data-testid="stBaseButton-secondary"] {{
+            background-color: transparent !important; border-color: rgba(255,255,255,.6) !important;
+        }}
+        .stApp button[data-testid="stBaseButton-secondary"] * {{ color: #FFFFFF !important; }}
+        """
+    else:
+        css += f"""
+        .stApp h1, .stApp h2, .stApp h3, .stApp [data-testid="stMarkdown"] strong {{ color: {AZUL} !important; }}
+        """
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
+def grafico_linhas(largo: pd.DataFrame, titulo_y: str, fundo: str, altura: int = 420):
+    """Gráfico de linhas (Altair) nas cores da marca, legível nos dois fundos."""
+    import altair as alt
+
+    largo = largo.copy()
+    largo.index.name = "Data"
+    longo = largo.reset_index().melt(id_vars="Data", var_name="Ativo", value_name="valor").dropna()
+    nomes_series = list(largo.columns)
+    paleta = PALETAS[fundo]
+    cores = [paleta[k % len(paleta)] for k in range(len(nomes_series))]
+    texto = "#FFFFFF" if fundo == "azul" else CINZA
+    grade = "rgba(255,255,255,0.15)" if fundo == "azul" else "#E6E9EC"
+    graf = (
+        alt.Chart(longo)
+        .mark_line(strokeWidth=2.2)
+        .encode(
+            x=alt.X("Data:T", title=None, axis=alt.Axis(format="%m/%y", labelAngle=0)),
+            y=alt.Y("valor:Q", title=titulo_y, axis=alt.Axis(format=".1f")),
+            color=alt.Color("Ativo:N", scale=alt.Scale(domain=nomes_series, range=cores),
+                            legend=alt.Legend(orient="bottom", title=None, columns=3, labelLimit=420)),
+            tooltip=[alt.Tooltip("Data:T", format="%d/%m/%Y"), "Ativo:N",
+                     alt.Tooltip("valor:Q", format=".2f", title=titulo_y)],
+        )
+        .properties(height=altura, width="container")
+        .configure(background="transparent", font="Lato")
+        .configure_axis(labelColor=texto, titleColor=texto, gridColor=grade, domainColor=grade,
+                        tickColor=grade, labelFontSize=12, titleFontSize=12)
+        .configure_legend(labelColor=texto, labelFontSize=12, symbolStrokeWidth=3)
+        .configure_view(strokeWidth=0)
+    )
+    try:
+        st.altair_chart(graf, theme=None, width="stretch")
+    except TypeError:  # versões antigas do Streamlit
+        st.altair_chart(graf, theme=None, use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Estado (ativos escolhidos ficam também na URL)
 # ──────────────────────────────────────────────────────────────────────────
 if "fi_ativos" not in st.session_state:
@@ -1002,7 +1135,27 @@ def adicionar(ident: str, nome: str | None = None):
 # ──────────────────────────────────────────────────────────────────────────
 # Interface
 # ──────────────────────────────────────────────────────────────────────────
-st.title("Fundos & Indicadores")
+# Fundo branco ou azul (canto superior direito). Usa o mesmo parâmetro de URL da plataforma: ?fundo=branco|azul
+if "fi_fundo" not in st.session_state:
+    st.session_state.fi_fundo = "Azul" if st.query_params.get("fundo", "branco") == "azul" else "Branco"
+
+
+def _trocou_fundo():
+    if st.session_state.fi_fundo is None:  # clicou no botão já selecionado: mantém
+        st.session_state.fi_fundo = "Azul" if st.query_params.get("fundo") == "azul" else "Branco"
+    st.query_params["fundo"] = st.session_state.fi_fundo.lower()
+
+
+col_titulo, col_fundo = st.columns([4, 1.6], vertical_alignment="center")
+with col_fundo:
+    if hasattr(st, "segmented_control"):
+        st.segmented_control("Fundo", ["Branco", "Azul"], key="fi_fundo", on_change=_trocou_fundo)
+    else:
+        st.radio("Fundo", ["Branco", "Azul"], key="fi_fundo", horizontal=True, on_change=_trocou_fundo)
+FUNDO = (st.session_state.fi_fundo or "Branco").lower()
+aplicar_tema(FUNDO)
+
+col_titulo.title("Fundos & Indicadores")
 st.caption(
     "Dados públicos e gratuitos: CVM (fundos), Banco Central (CDI, Selic, IPCA, IGP-M, Dólar) e "
     "Yahoo Finance (bolsa). Rentabilidade passada não garante rentabilidade futura."
@@ -1176,7 +1329,7 @@ with aba_rent:
     acum = painel.apply(lambda c: c / c.dropna().iloc[0] - 1) * 100
     acum.columns = [nomes[c] for c in acum.columns]
     st.markdown("**Retorno acumulado no período (%)**")
-    st.line_chart(acum, height=420)
+    grafico_linhas(acum, "Retorno acumulado (%)", FUNDO)
 
     # ── Rentabilidade em R$ e em US$ nos meses escolhidos (independe do botão de conversão do gráfico)
     st.markdown("**Rentabilidade em R\\$ e em US\\$ nos meses escolhidos**")
@@ -1216,8 +1369,7 @@ with aba_rent:
                 "Moeda original": "R$" if moeda(i) == "BRL" else "US$",
             }
         tab_moeda = pd.DataFrame(linhas).T
-        st.dataframe(tab_moeda.style.format({"Em R$": fmt_pct, "Em US$": fmt_pct})
-                     .map(cor_retorno, subset=["Em R$", "Em US$"]))
+        st.dataframe(tabela(tab_moeda, {"Em R$": fmt_pct, "Em US$": fmt_pct}, ["Em R$", "Em US$"]))
     else:
         for m_rot, chave in (("Em R$", "BRL"), ("Em US$", "USD")):
             mensal_m = {}
@@ -1231,7 +1383,7 @@ with aba_rent:
                 }
             if mensal_m:
                 st.caption(m_rot.replace("$", "\\$"))
-                st.dataframe(pd.DataFrame(mensal_m).T.style.format(fmt_pct).map(cor_retorno))
+                st.dataframe(tabela(pd.DataFrame(mensal_m).T, fmt_pct, True))
     if ptax is not None:
         r_dolar = retorno_janela(ptax, de, ate)[0]
         st.caption(
@@ -1258,7 +1410,7 @@ with aba_rent:
     alvo = por_nome[st.selectbox("Ativo", list(por_nome), key="fi_cal")]
     cal = tabela_calendario(series[alvo], bench if alvo != bench_id else None)
     if not cal.empty:
-        st.dataframe(cal.style.format(fmt_pct).map(cor_retorno, subset=MESES))
+        st.dataframe(tabela(cal, fmt_pct, MESES))
 
 with aba_comp:
     tab = pd.DataFrame({nomes[i]: metricas(series[i], bench if i != bench_id else None, extras[i]) for i in series}).T
@@ -1268,7 +1420,8 @@ with aba_comp:
     formatos.update({c: (lambda x: fmt_num(x, 2)) for c in tab if c == "Sharpe (vs bench.)"})
     formatos.update({c: (lambda x: fmt_num(x, 1)) for c in tab if "R$ mi" in c})
     formatos.update({c: (lambda x: fmt_num(x, 0)) for c in tab if c == "Cotistas"})
-    st.dataframe(tab.style.format(formatos))
+    formatos.update({c: (lambda d: d.strftime("%d/%m/%Y")) for c in ("Início", "Fim") if c in tab})
+    st.dataframe(tabela(tab, formatos))
     st.caption(
         "Volatilidade anualizada pela frequência da série (252 dias úteis ou 12 meses). "
         "Sharpe = (retorno anualizado − benchmark anualizado) ÷ volatilidade; em períodos < 1 ano usa o "
@@ -1277,7 +1430,7 @@ with aba_comp:
     st.markdown("**Drawdown (%)**")
     dd = painel.apply(lambda c: c / c.cummax() - 1) * 100
     dd.columns = [nomes[c] for c in dd.columns]
-    st.area_chart(dd, height=300)
+    grafico_linhas(dd, "Drawdown (%)", FUNDO, altura=300)
 
     fundos = [i for i in series if i.startswith("fi:")]
     if fundos:
@@ -1292,7 +1445,7 @@ with aba_mens:
     mensal = pd.DataFrame({nomes[i]: retornos_mensais(s) for i, s in series.items()}).sort_index(ascending=False)
     mensal.index = mensal.index.strftime("%m/%Y")
     st.markdown("**Retorno mensal de todos os ativos**")
-    st.dataframe(mensal.style.format(fmt_pct), height=480)
+    st.dataframe(tabela(mensal, fmt_pct, True), height=480)
 
 with aba_dados:
     bruto = painel.copy()
