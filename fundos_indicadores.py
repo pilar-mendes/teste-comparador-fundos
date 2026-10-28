@@ -1142,6 +1142,87 @@ def grafico_linhas(largo: pd.DataFrame, titulo_y: str, fundo: str, altura: int =
         st.altair_chart(graf, theme=None, use_container_width=True)
 
 
+def metricas_vs_bench(s: pd.Series, b: pd.Series) -> tuple[dict, pd.Series]:
+    """Indicadores do ativo contra o benchmark, na janela em que os dois têm dados.
+
+    Devolve (indicadores, série do retorno relativo acumulado em %).
+    """
+    s = s.dropna()
+    b_al = alinhar(b.dropna(), s.index)          # benchmark nas datas do ativo (último valor disponível)
+    ok = b_al.notna()
+    s, b_al = s[ok], b_al[ok]
+    if len(s) < 3:
+        return {}, pd.Series(dtype=float)
+    ra, rb = s.iloc[-1] / s.iloc[0] - 1, b_al.iloc[-1] / b_al.iloc[0] - 1
+    dias = (s.index[-1] - s.index[0]).days
+    anual = lambda r: (1 + r) ** (365.25 / dias) - 1 if dias >= 365 else np.nan  # noqa: E731
+
+    # Frequência dos retornos: mensal se houver ≥ 12 meses (mais robusto a defasagens de data entre
+    # fundos e índices); diária para períodos curtos quando as duas séries são diárias.
+    rm_a, rm_b = retornos_mensais(s), retornos_mensais(b_al)
+    comuns = rm_a.index.intersection(rm_b.index)
+    if len(comuns) >= 12 or periodos_por_ano(s) < 252 or periodos_por_ano(b.dropna()) < 252:
+        y, x, ppa, base = rm_a.loc[comuns], rm_b.loc[comuns], 12, "mensal"
+    else:
+        y, x, ppa, base = s.pct_change().dropna(), b_al.pct_change().dropna(), 252, "diária"
+        x = x.loc[y.index]
+
+    m = {
+        "Retorno do ativo": ra,
+        "Retorno do benchmark": rb,
+        "Diferença (p.p.)": ra - rb,
+        "% do benchmark": ra / rb if rb else np.nan,
+        "Ativo (a.a.)": anual(ra),
+        "Benchmark (a.a.)": anual(rb),
+        "Excesso de retorno (a.a.)": anual(ra) - anual(rb) if dias >= 365 else np.nan,
+    }
+    if len(y) >= 3 and x.var() > 0:
+        beta = float(np.cov(y, x, ddof=1)[0, 1] / x.var(ddof=1))
+        alfa_periodo = float(y.mean() - beta * x.mean())
+        ativo = y - x
+        te = float(ativo.std(ddof=1) * np.sqrt(ppa))
+        corr = float(np.corrcoef(y, x)[0, 1])
+        sobe, desce = x > 0, x < 0
+        m.update({
+            "Alfa (a.a.)": (1 + alfa_periodo) ** ppa - 1,
+            "Beta": beta,
+            "Correlação": corr,
+            "R²": corr ** 2,
+            "Tracking error (a.a.)": te,
+            "Information ratio": float(ativo.mean() * ppa / te) if te > 0 else np.nan,
+            "Captura de alta": float(y[sobe].mean() / x[sobe].mean()) if sobe.sum() >= 2 else np.nan,
+            "Captura de baixa": float(y[desce].mean() / x[desce].mean()) if desce.sum() >= 2 else np.nan,
+            "% períodos acima do bench.": float((y > x).mean()),
+            "Base de cálculo": f"{base} ({len(y)} retornos)",
+        })
+    else:
+        m["Base de cálculo"] = "poucos dados para regressão"
+    m["Janela"] = f"{s.index[0]:%d/%m/%Y} a {s.index[-1]:%d/%m/%Y}"
+    relativo = ((s / s.iloc[0]) / (b_al / b_al.iloc[0]) - 1) * 100
+    return m, relativo
+
+
+FMT_BENCH = {  # como mostrar cada indicador
+    "pct": ["Retorno do ativo", "Retorno do benchmark", "% do benchmark", "Ativo (a.a.)", "Benchmark (a.a.)",
+            "Excesso de retorno (a.a.)", "Alfa (a.a.)", "Tracking error (a.a.)", "Captura de alta",
+            "Captura de baixa", "% períodos acima do bench."],
+    "pp": ["Diferença (p.p.)"],
+    "num": ["Beta", "Correlação", "R²", "Information ratio"],
+}
+
+
+def fmt_indicador(nome: str, v) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "–"
+    if nome in FMT_BENCH["pct"]:
+        return fmt_pct(v)
+    if nome in FMT_BENCH["pp"]:
+        return f"{v * 100:+.2f}".replace(".", ",") + " p.p."
+    if nome in FMT_BENCH["num"]:
+        return fmt_num(v, 2)
+    return str(v)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Estado (ativos escolhidos ficam também na URL)
 # ──────────────────────────────────────────────────────────────────────────
@@ -1368,12 +1449,12 @@ def _nome_exibido(i: str) -> str:
 nomes = {i: _nome_exibido(i) for i in series}
 rotulos_bench = {"Nenhum": None, **{nomes[i]: i for i in series}}
 padrao = next((k for k, v in enumerate(rotulos_bench.values()) if v == "bcb:12"), 0)
-bench_id = rotulos_bench[c3.selectbox("Benchmark (para % do bench. e Sharpe)", list(rotulos_bench), index=padrao)]
+bench_id = rotulos_bench[c3.selectbox("Benchmark (aba Vs. Benchmark, Comparador e mês a mês)", list(rotulos_bench), index=padrao)]
 bench = series.get(bench_id) if bench_id else None
 
 # Abas -----------------------------------------------------------------------
-aba_rent, aba_comp, aba_mens, aba_dados = st.tabs(
-    ["📈 Rentabilidade", "⚖️ Comparador", "🗓️ Retornos mensais", "⬇️ Dados"]
+aba_rent, aba_comp, aba_bench, aba_mens, aba_dados = st.tabs(
+    ["📈 Rentabilidade", "⚖️ Comparador", "🎯 Vs. Benchmark", "🗓️ Retornos mensais", "⬇️ Dados"]
 )
 painel = pd.concat(series, axis=1, sort=True).ffill()
 
@@ -1492,6 +1573,56 @@ with aba_comp:
                 st.dataframe(pd.DataFrame(fichas).fillna("").astype(str))
             else:
                 st.info("Fundos não encontrados no cadastro.")
+
+with aba_bench:
+    if bench is None:
+        st.info("Escolha um benchmark no seletor **Benchmark** (acima, ao lado do período) para ver alfa, beta, "
+                "tracking error e os demais indicadores. O benchmark precisa estar entre os ativos selecionados "
+                "(use os atalhos, como CDI, Ibovespa, MSCI World ou CPI + 5%).")
+    else:
+        st.markdown(f"**Comparação com o benchmark: {nomes[bench_id]}**")
+        indicadores, relativos = {}, {}
+        for i in series:
+            if i == bench_id:
+                continue
+            m, rel = metricas_vs_bench(series[i], bench)
+            if m:
+                indicadores[nomes[i]] = m
+                relativos[nomes[i]] = rel
+        if not indicadores:
+            st.info("Adicione ao menos um ativo além do benchmark.")
+        else:
+            ordem = list(dict.fromkeys(k for m in indicadores.values() for k in m))
+            tabela_bench = pd.DataFrame(
+                {ativo: [fmt_indicador(k, m.get(k)) for k in ordem] for ativo, m in indicadores.items()},
+                index=ordem,
+            )
+            st.dataframe(tabela_bench, height=min(38 * (len(ordem) + 1) + 4, 760))
+
+            st.markdown("**Retorno relativo ao benchmark (%)**")
+            grafico_linhas(pd.DataFrame(relativos).sort_index().ffill(), "Acima (+) / abaixo (−) do benchmark (%)",
+                           FUNDO, altura=320)
+            st.caption("Linha subindo = o ativo está ganhando do benchmark naquele trecho; descendo = perdendo.")
+
+            with st.expander("O que significa cada indicador"):
+                st.markdown(
+                    "- **Diferença (p.p.)**: retorno do ativo menos o do benchmark no período.\n"
+                    "- **% do benchmark**: retorno do ativo ÷ retorno do benchmark (ex.: 120% do CDI).\n"
+                    "- **Excesso de retorno (a.a.)**: diferença entre os retornos anualizados (períodos ≥ 1 ano).\n"
+                    "- **Alfa (a.a.)**: retorno que sobra depois de descontar a parte explicada pelo benchmark "
+                    "(intercepto da regressão do ativo contra o benchmark, anualizado). Positivo = gestão agregou valor.\n"
+                    "- **Beta**: sensibilidade ao benchmark. 1 = anda junto; 0,5 = metade do movimento; > 1 = amplifica.\n"
+                    "- **Correlação / R²**: quanto o ativo acompanha o benchmark (R² = parcela explicada por ele).\n"
+                    "- **Tracking error (a.a.)**: volatilidade da diferença de retornos; quanto o ativo se descola.\n"
+                    "- **Information ratio**: excesso médio anualizado ÷ tracking error. Acima de 0,5 é considerado bom.\n"
+                    "- **Captura de alta / de baixa**: nos períodos em que o benchmark subiu (caiu), quanto o ativo "
+                    "acompanhou. Ideal: captura de alta alta e de baixa baixa.\n"
+                    "- **% períodos acima do bench.**: em quantos meses (ou dias) o ativo ganhou do benchmark.\n\n"
+                    "Os cálculos usam retornos mensais quando há 12 meses ou mais em comum (evita distorções de "
+                    "datas entre fundos e índices) e diários em períodos curtos. Valem as conversões de moeda "
+                    "ligadas acima: compare ativo e benchmark na mesma moeda."
+                )
+
 
 with aba_mens:
     mensal = pd.DataFrame({nomes[i]: retornos_mensais(s) for i, s in series.items()}).sort_index(ascending=False)
