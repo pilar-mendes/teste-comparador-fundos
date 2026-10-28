@@ -1447,10 +1447,29 @@ def _nome_exibido(i: str) -> str:
 
 
 nomes = {i: _nome_exibido(i) for i in series}
-rotulos_bench = {"Nenhum": None, **{nomes[i]: i for i in series}}
-padrao = next((k for k, v in enumerate(rotulos_bench.values()) if v == "bcb:12"), 0)
-bench_id = rotulos_bench[c3.selectbox("Benchmark (aba Vs. Benchmark, Comparador e mês a mês)", list(rotulos_bench), index=padrao)]
-bench = series.get(bench_id) if bench_id else None
+# Benchmarks disponíveis (não precisam estar entre os ativos selecionados)
+BENCHMARKS = {"Nenhum": None, "CPI + 5%": "inf:cpi:5", "MSCI World": "idx:msciworld"}
+escolha_bench = c3.selectbox("Benchmark", list(BENCHMARKS), index=2, key="fi_bench")
+bench_id = BENCHMARKS[escolha_bench]
+bench_nativo, bench, nome_bench = None, None, None
+if bench_id:
+    nome_bench = nome_padrao(bench_id)
+    try:
+        bench_nativo = nativas[bench_id] if bench_id in nativas else carregar(bench_id, inicio, fim)["valor"].dropna()
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Não consegui carregar o benchmark {nome_bench}: {e}")
+    if bench_nativo is not None and len(bench_nativo) > 1:
+        # versão do benchmark que segue os botões de conversão (usada no Comparador e no mês a mês)
+        if bench_id in series:
+            bench = series[bench_id]
+        elif em_reais and moeda(bench_id) == "USD":
+            bench = em_moeda(bench_nativo, "USD", "BRL", ptax)
+        elif em_dolar and moeda(bench_id) == "BRL":
+            bench = em_moeda(bench_nativo, "BRL", "USD", ptax)
+        else:
+            bench = bench_nativo
+    else:
+        bench_nativo = None
 
 # Abas -----------------------------------------------------------------------
 aba_rent, aba_comp, aba_bench, aba_mens, aba_dados = st.tabs(
@@ -1575,22 +1594,36 @@ with aba_comp:
                 st.info("Fundos não encontrados no cadastro.")
 
 with aba_bench:
-    if bench is None:
-        st.info("Escolha um benchmark no seletor **Benchmark** (acima, ao lado do período) para ver alfa, beta, "
-                "tracking error e os demais indicadores. O benchmark precisa estar entre os ativos selecionados "
-                "(use os atalhos, como CDI, Ibovespa, MSCI World ou CPI + 5%).")
+    if bench_nativo is None:
+        st.info("Escolha um benchmark no seletor **Benchmark** (acima, ao lado do período): CPI + 5% ou MSCI World. "
+                "Aqui aparecem alfa, beta, tracking error e os demais indicadores de cada ativo contra ele.")
     else:
-        st.markdown(f"**Comparação com o benchmark: {nomes[bench_id]}**")
-        indicadores, relativos = {}, {}
+        cb1, cb2 = st.columns([3, 2], vertical_alignment="bottom")
+        moeda_comp = cb2.radio(
+            "Comparar em", ["R$", "US$"], horizontal=True, key="fi_moeda_bench",
+            help="Para a comparação ser justa, ativo e benchmark precisam estar na mesma moeda. "
+                 "Em R$: o que é cotado em dólar (MSCI, CPI + 5%, S&P…) é convertido pela PTAX. "
+                 "Em US$: o que é cotado em reais (fundos, CDI, Ibovespa…) é convertido pela PTAX.",
+        )
+        destino = "BRL" if moeda_comp == "R$" else "USD"
+        cb1.markdown(f"**Comparação com o benchmark: {nome_bench}, tudo em {moeda_comp.replace('$', chr(92) + '$')}**")
+        b_conv = em_moeda(bench_nativo, moeda(bench_id), destino, ptax)
+        indicadores, relativos, sem_cambio = {}, {}, []
         for i in series:
             if i == bench_id:
                 continue
-            m, rel = metricas_vs_bench(series[i], bench)
+            a_conv = em_moeda(nativas[i], moeda(i), destino, ptax)
+            if a_conv is None or b_conv is None:
+                sem_cambio.append(st.session_state.fi_ativos[i])
+                continue
+            m, rel = metricas_vs_bench(a_conv, b_conv)
             if m:
-                indicadores[nomes[i]] = m
-                relativos[nomes[i]] = rel
+                indicadores[st.session_state.fi_ativos[i]] = m
+                relativos[st.session_state.fi_ativos[i]] = rel
+        if sem_cambio:
+            st.warning("Sem a cotação do dólar (PTAX) agora, não deu para converter: " + ", ".join(sem_cambio))
         if not indicadores:
-            st.info("Adicione ao menos um ativo além do benchmark.")
+            st.info("Adicione ao menos um ativo para comparar com o benchmark.")
         else:
             ordem = list(dict.fromkeys(k for m in indicadores.values() for k in m))
             tabela_bench = pd.DataFrame(
@@ -1598,6 +1631,10 @@ with aba_bench:
                 index=ordem,
             )
             st.dataframe(tabela_bench, height=min(38 * (len(ordem) + 1) + 4, 760))
+            st.caption(
+                f"Ativos e benchmark em {moeda_comp}: o que estava em outra moeda foi convertido pela PTAX do dia. "
+                "Os botões de conversão lá de cima não afetam esta aba."
+            )
 
             st.markdown("**Retorno relativo ao benchmark (%)**")
             grafico_linhas(pd.DataFrame(relativos).sort_index().ffill(), "Acima (+) / abaixo (−) do benchmark (%)",
@@ -1619,8 +1656,8 @@ with aba_bench:
                     "acompanhou. Ideal: captura de alta alta e de baixa baixa.\n"
                     "- **% períodos acima do bench.**: em quantos meses (ou dias) o ativo ganhou do benchmark.\n\n"
                     "Os cálculos usam retornos mensais quando há 12 meses ou mais em comum (evita distorções de "
-                    "datas entre fundos e índices) e diários em períodos curtos. Valem as conversões de moeda "
-                    "ligadas acima: compare ativo e benchmark na mesma moeda."
+                    "datas entre fundos e índices) e diários em períodos curtos. Ativo e benchmark são sempre "
+                    "comparados na mesma moeda, escolhida em **Comparar em** (R$ ou US$)."
                 )
 
 
