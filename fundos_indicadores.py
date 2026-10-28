@@ -1038,11 +1038,35 @@ def aplicar_tema(fundo: str):
     .stApp button[data-variant="segmented_control"][aria-checked="true"] {{
         background-color: {VERDE} !important; border-color: {VERDE} !important;
     }}
+    .stApp button[data-variant="pills"][aria-checked="true"],
+    .stApp button[data-variant="segmented_control"][aria-checked="true"] {{ color: #FFFFFF !important; }}
+    .stApp button[data-variant="segmented_control"], .stApp button[data-variant="pills"] {{ outline-color: {VERDE} !important; }}
     .stApp button[data-variant="pills"][aria-checked="true"] *,
     .stApp button[data-variant="segmented_control"][aria-checked="true"] * {{ color: #FFFFFF !important; }}
     .stApp button[data-variant="segmented_control"], .stApp button[data-variant="pills"] {{ color: {AZUL}; }}
     .stApp [data-baseweb="tab-highlight"], .stApp [role="tab"][aria-selected="true"]::after {{ background-color: {VERDE} !important; }}
-    .stApp [data-testid="stSliderThumbValue"] p {{ color: {VERDE} !important; }}
+    .stApp [data-testid="stSliderThumbValue"], .stApp [data-testid="stSliderThumbValue"] * {{ color: {VERDE} !important; }}
+    /* tira o vermelho padrão do Streamlit: tudo que é "selecionado" fica no verde da marca */
+    .stApp [data-testid="stSlider"] [role="group"] > div > div {{ background-color: {VERDE} !important; }}
+    .stApp [data-testid="stRadioOption"][data-selected="true"] > div > div:not([data-testid]),
+    .stApp [data-testid="stRadioOption"] input:checked + div {{ background-color: {VERDE} !important; border-color: {VERDE} !important; }}
+    .stApp [data-testid="stCheckbox"] label:has(input:checked) > div {{ background-color: {VERDE} !important; }}
+    .stApp button[data-testid="stBaseButton-primary"], .stApp button[kind="primary"] {{
+        background-color: {VERDE} !important; border-color: {VERDE} !important; color: #FFFFFF !important;
+    }}
+    .stApp button[data-testid="stBaseButton-primary"]:hover {{ background-color: #3FA393 !important; border-color: #3FA393 !important; }}
+    .stApp button[data-testid="stBaseButton-primary"] * {{ color: #FFFFFF !important; }}
+    .stApp [data-testid="stTab"][aria-selected="true"], .stApp [data-testid="stTab"][aria-selected="true"] p,
+    .stApp [data-testid="stTab"]:hover p {{ color: {VERDE} !important; }}
+    .stApp [data-testid="stTab"] > div:not([data-testid]) {{ background-color: {VERDE} !important; }}
+    .stApp [data-testid="stTextInputRootElement"]:focus-within,
+    .stApp [data-testid="stNumberInputContainer"]:focus-within,
+    .stApp [data-testid="stSelectbox"] div:focus-within, .stApp [data-testid="stMultiSelect"] div:focus-within,
+    .stApp [data-testid="stDateInput"] div:focus-within {{ border-color: {VERDE} !important; }}
+    .stApp *:focus-visible {{ outline-color: {VERDE} !important; }}
+    .stApp button[data-variant="segmented_control"]:hover, .stApp button[data-variant="pills"]:hover {{
+        border-color: {VERDE} !important;
+    }}
     .stApp [data-testid="stDataFrame"] {{ border-radius: 8px; overflow: hidden; }}
     """
     if fundo == "azul":
@@ -1240,7 +1264,10 @@ hoje = date.today()
 c1, c2, c3 = st.columns([2, 2, 3])
 INICIO_GESTAO = date(2021, 12, 31)  # início da gestão
 ROTULO_GESTAO = f"Desde o início da gestão ({INICIO_GESTAO:%d/%m/%Y})"
-janela = c1.selectbox("Período", ["12 meses", "No ano", "24 meses", "36 meses", "60 meses", ROTULO_GESTAO, "Personalizado"])
+INCEPTION = date(2013, 5, 13)       # Since Inception
+ROTULO_INCEPTION = f"Since Inception ({INCEPTION:%d/%m/%Y})"
+janela = c1.selectbox("Período", ["12 meses", "No ano", "24 meses", "36 meses", "60 meses", ROTULO_GESTAO,
+                                  ROTULO_INCEPTION, "Personalizado"])
 if janela == "Personalizado":
     datas = c2.date_input("De / até", value=(hoje - timedelta(days=365), hoje), format="DD/MM/YYYY")
     inicio, fim = (datas if len(datas) == 2 else (datas[0], hoje))
@@ -1248,15 +1275,33 @@ elif janela == "No ano":
     inicio, fim = date(hoje.year - 1, 12, 31), hoje
 elif janela == ROTULO_GESTAO:
     inicio, fim = INICIO_GESTAO, hoje
+elif janela == ROTULO_INCEPTION:
+    inicio, fim = INCEPTION, hoje
 else:
     inicio, fim = (pd.Timestamp(hoje) - pd.DateOffset(months=int(janela.split()[0]))).date(), hoje
 if janela != "Personalizado":
     c2.text_input("De / até", f"{inicio:%d/%m/%Y} – {fim:%d/%m/%Y}", disabled=True)
 tem_usd = any(moeda(i) == "USD" for i in st.session_state.fi_ativos)
+tem_brl = any(moeda(i) == "BRL" for i in st.session_state.fi_ativos)
+
+
+def _so_um_conversor(ligado: str, outro: str):
+    """Os dois botões de conversão não ficam ligados ao mesmo tempo."""
+    if st.session_state.get(ligado):
+        st.session_state[outro] = False
+
+
 em_reais = st.toggle(
-    "Converter ativos em dólar para reais (PTAX)", value=False, disabled=not tem_usd,
-    help="S&P 500 TR, MSCI e ações dos EUA são cotados em USD. Ligue para comparar com fundos em R$ sem hedge.",
-)
+    "Converter ativos em dólar para reais (PTAX)", disabled=not tem_usd, key="fi_conv_brl",
+    on_change=_so_um_conversor, args=("fi_conv_brl", "fi_conv_usd"),
+    help="S&P 500 TR, MSCI, CPI + X% e ações dos EUA são cotados em US$. Ligue para comparar com fundos em R$ sem hedge.",
+) and tem_usd
+em_dolar = st.toggle(
+    "Converter ativos em reais para dólar (PTAX)", disabled=not tem_brl, key="fi_conv_usd",
+    on_change=_so_um_conversor, args=("fi_conv_usd", "fi_conv_brl"),
+    help="Fundos, CDI, IPCA, Ibovespa e ações brasileiras são cotados em R$. Ligue para ver tudo em US$, "
+         "como um investidor estrangeiro veria.",
+) and tem_brl
 
 # Download -------------------------------------------------------------------
 ids = list(st.session_state.fi_ativos)
@@ -1283,12 +1328,14 @@ with st.spinner("Buscando dados…"):
             falhas.append(f"**{nome}**: sem dados no período.")
             continue
         nativas[ident] = df["valor"].dropna()
-        if em_reais and moeda(ident) == "USD":
+        converter = (em_reais and moeda(ident) == "USD") or (em_dolar and moeda(ident) == "BRL")
+        if converter:
             if ptax is None:
                 falhas.append(f"**{nome}**: não consegui a PTAX para converter ({erro_ptax}).")
                 continue
             df = df.copy()
-            df["valor"] = df["valor"] * alinhar(ptax, df.index)
+            cambio = alinhar(ptax, df.index)
+            df["valor"] = df["valor"] * cambio if em_reais else df["valor"] / cambio
         series[ident] = df["valor"].dropna()
         extras[ident] = df
 
@@ -1309,11 +1356,16 @@ for f in falhas:
 if not series:
     st.stop()
 
-nomes = {
-    i: st.session_state.fi_ativos[i].replace("(USD)", "(R$)") + ("" if "(USD)" in st.session_state.fi_ativos[i] else " em R$")
-    if em_reais and moeda(i) == "USD" else st.session_state.fi_ativos[i]
-    for i in series
-}
+def _nome_exibido(i: str) -> str:
+    n = st.session_state.fi_ativos[i]
+    if em_reais and moeda(i) == "USD":
+        return n.replace("(USD)", "(R$)") if "(USD)" in n else n + " em R$"
+    if em_dolar and moeda(i) == "BRL":
+        return n + " em US$"
+    return n
+
+
+nomes = {i: _nome_exibido(i) for i in series}
 rotulos_bench = {"Nenhum": None, **{nomes[i]: i for i in series}}
 padrao = next((k for k, v in enumerate(rotulos_bench.values()) if v == "bcb:12"), 0)
 bench_id = rotulos_bench[c3.selectbox("Benchmark (para % do bench. e Sharpe)", list(rotulos_bench), index=padrao)]
