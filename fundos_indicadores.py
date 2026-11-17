@@ -1047,7 +1047,13 @@ def aplicar_tema(fundo: str):
     .stApp [data-baseweb="tab-highlight"], .stApp [role="tab"][aria-selected="true"]::after {{ background-color: {VERDE} !important; }}
     .stApp [data-testid="stSliderThumbValue"], .stApp [data-testid="stSliderThumbValue"] * {{ color: {VERDE} !important; }}
     /* tira o vermelho padrão do Streamlit: tudo que é "selecionado" fica no verde da marca */
-    .stApp [data-testid="stSlider"] [role="group"] > div > div {{ background-color: {VERDE} !important; }}
+    /* barra de meses: bolinhas no verde da marca; a linha (pintada pelo Streamlit em vermelho) vira azul.
+       O Streamlit desenha a linha com um degradê calculado na hora, então o azul é obtido com um filtro
+       de cor (vermelho padrão → azul #223D5E). Se um dia definir primaryColor no config.toml, apague o filtro. */
+    .stApp [data-testid="stSlider"] [role="group"] > div > div[data-rac] {{ background-color: {VERDE} !important; }}
+    .stApp [data-testid="stSlider"] [role="group"] > div > div:not([data-rac]) {{
+        filter: hue-rotate(228deg) saturate(0.6) brightness(0.66);
+    }}
     .stApp [data-testid="stRadioOption"][data-selected="true"] > div > div:not([data-testid]),
     .stApp [data-testid="stRadioOption"] input:checked + div {{ background-color: {VERDE} !important; border-color: {VERDE} !important; }}
     .stApp [data-testid="stCheckbox"] label:has(input:checked) > div {{ background-color: {VERDE} !important; }}
@@ -1073,7 +1079,7 @@ def aplicar_tema(fundo: str):
         css += f"""
         .stApp, [data-testid="stHeader"], [data-testid="stBottomBlockContainer"] {{ background-color: {AZUL} !important; }}
         [data-testid="stHeader"] * {{ color: #FFFFFF !important; }}
-        .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
         .stApp [data-testid="stMarkdown"] p, .stApp [data-testid="stMarkdown"] strong, .stApp [data-testid="stMarkdown"] li,
         .stApp [data-testid="stWidgetLabel"] p, .stApp [data-testid="stRadioOption"] p,
         .stApp [data-testid="stCheckbox"] p, .stApp label[data-baseweb="checkbox"] p,
@@ -1084,6 +1090,13 @@ def aplicar_tema(fundo: str):
             color: #FFFFFF !important;
         }}
         .stApp [data-testid="stExpander"] summary svg {{ fill: #FFFFFF !important; color: #FFFFFF !important; }}
+        .stApp [data-testid="stSlider"] [role="group"] > div > div:not([data-rac]) {{
+            filter: hue-rotate(232deg) saturate(0.3) brightness(1.92);  /* azul-claro #8FB3DA sobre o fundo azul */
+        }}
+        .stApp [data-testid="stSlider"] p {{ color: rgba(255,255,255,.7) !important; }}
+        .stApp [data-testid="stSlider"] [data-testid="stSliderThumbValue"] p,
+        .stApp [data-testid="stSlider"] [data-testid="stWidgetLabel"] p {{ color: #FFFFFF !important; }}
+        .stApp [data-testid="stSlider"] [data-testid="stSliderThumbValue"] p {{ color: {VERDE} !important; }}
         .stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] * {{
             color: rgba(255,255,255,.75) !important;
         }}
@@ -1101,7 +1114,7 @@ def aplicar_tema(fundo: str):
         """
     else:
         css += f"""
-        .stApp h1, .stApp h2, .stApp h3, .stApp [data-testid="stMarkdown"] strong {{ color: {AZUL} !important; }}
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp [data-testid="stMarkdown"] strong {{ color: {AZUL} !important; }}
         """
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
@@ -1147,8 +1160,11 @@ def metricas_vs_bench(s: pd.Series, b: pd.Series) -> tuple[dict, pd.Series]:
 
     Devolve (indicadores, série do retorno relativo acumulado em %).
     """
-    s = s.dropna()
-    b_al = alinhar(b.dropna(), s.index)          # benchmark nas datas do ativo (último valor disponível)
+    s, b = s.dropna(), b.dropna()
+    # Mesma janela para os dois: o ativo só é medido até o último dado do benchmark. Importante para o
+    # CPI + 5%, que é divulgado com ~1 mês de atraso: sem isso, o ativo teria 12 meses e o benchmark 11.
+    s = s[(s.index >= b.index[0]) & (s.index <= b.index[-1])] if len(b) else s
+    b_al = alinhar(b, s.index)                   # benchmark nas datas do ativo (último valor disponível)
     ok = b_al.notna()
     s, b_al = s[ok], b_al[ok]
     if len(s) < 3:
@@ -1185,6 +1201,7 @@ def metricas_vs_bench(s: pd.Series, b: pd.Series) -> tuple[dict, pd.Series]:
         sobe, desce = x > 0, x < 0
         m.update({
             "Alfa (a.a.)": (1 + alfa_periodo) ** ppa - 1,
+            "Alfa acumulado (período)": (1 + alfa_periodo) ** len(y) - 1,
             "Beta": beta,
             "Correlação": corr,
             "R²": corr ** 2,
@@ -1204,7 +1221,7 @@ def metricas_vs_bench(s: pd.Series, b: pd.Series) -> tuple[dict, pd.Series]:
 
 FMT_BENCH = {  # como mostrar cada indicador
     "pct": ["Retorno do ativo", "Retorno do benchmark", "% do benchmark", "Ativo (a.a.)", "Benchmark (a.a.)",
-            "Excesso de retorno (a.a.)", "Alfa (a.a.)", "Tracking error (a.a.)", "Captura de alta",
+            "Excesso de retorno (a.a.)", "Alfa (a.a.)", "Alfa acumulado (período)", "Tracking error (a.a.)", "Captura de alta",
             "Captura de baixa", "% períodos acima do bench."],
     "pp": ["Diferença (p.p.)"],
     "num": ["Beta", "Correlação", "R²", "Information ratio"],
@@ -1473,7 +1490,7 @@ if bench_id:
 
 # Abas -----------------------------------------------------------------------
 aba_rent, aba_comp, aba_bench, aba_mens, aba_dados = st.tabs(
-    ["📈 Rentabilidade", "⚖️ Comparador", "🎯 Vs. Benchmark", "🗓️ Retornos mensais", "⬇️ Dados"]
+    ["Rentabilidade", "Comparador", "Vs. Benchmark", "Retornos mensais", "Dados"]
 )
 painel = pd.concat(series, axis=1, sort=True).ffill()
 
@@ -1630,9 +1647,32 @@ with aba_bench:
                 {ativo: [fmt_indicador(k, m.get(k)) for k in ordem] for ativo, m in indicadores.items()},
                 index=ordem,
             )
-            st.dataframe(tabela_bench, height=min(38 * (len(ordem) + 1) + 4, 760))
+            # 1ª linha: qual benchmark e qual moeda foram usados em cada coluna (conferência)
+            tabela_bench = pd.concat([
+                pd.DataFrame({ativo: [f"{nome_bench} · em {moeda_comp}"] for ativo in indicadores}, index=["Benchmark usado"]),
+                tabela_bench,
+            ])
+            ordem = ["Benchmark usado"] + ordem
+            # destaque (negrito) nas 3 primeiras linhas: retorno do ativo, do benchmark e a diferença
+            destaque = {"Retorno do ativo", "Retorno do benchmark", "Diferença (p.p.)"}
+            negrito = "font-weight: 700"
+            tabela_bench = tabela_bench.rename_axis("Indicador").reset_index()  # nome do indicador vira coluna (para o negrito pegar nele também)
+            estilo_bench = tabela_bench.style.apply(
+                lambda linha: [negrito if linha["Indicador"] in destaque else ""] * len(linha), axis=1
+            )
+            st.dataframe(estilo_bench, hide_index=True, height=min(38 * (len(ordem) + 1) + 4, 760))
+            if bench_id.startswith("inf:"):
+                st.info(
+                    "Benchmark de inflação + spread: a série é mensal e o CPI sai com cerca de 1 mês de atraso, "
+                    "então a comparação vai só até o último mês publicado (veja a linha **Janela**). Como esse "
+                    "benchmark quase não oscila, beta, alfa e correlação da regressão dizem pouco; para ele, "
+                    "olhe principalmente **Diferença**, **% do benchmark** e **Excesso de retorno**."
+                )
             st.caption(
-                f"Ativos e benchmark em {moeda_comp}: o que estava em outra moeda foi convertido pela PTAX do dia. "
+                f"Cada coluna é um ativo selecionado comparado com o benchmark {nome_bench}. "
+                "O próprio benchmark não aparece como coluna; outros índices da lista (ex.: MSCI World quando o "
+                "benchmark é CPI + 5%) aparecem como ativos comparados com ele. "
+                f"Tudo em {moeda_comp}: o que estava em outra moeda foi convertido pela PTAX do dia. "
                 "Os botões de conversão lá de cima não afetam esta aba."
             )
 
@@ -1643,21 +1683,45 @@ with aba_bench:
 
             with st.expander("O que significa cada indicador"):
                 st.markdown(
-                    "- **Diferença (p.p.)**: retorno do ativo menos o do benchmark no período.\n"
+                    "##### Retorno\n"
+                    "- **Diferença (p.p.)**: conta simples. Retorno do ativo menos o retorno do benchmark no "
+                    "período inteiro, sem anualizar. Não leva em conta quanto risco o ativo correu.\n"
                     "- **% do benchmark**: retorno do ativo ÷ retorno do benchmark (ex.: 120% do CDI).\n"
-                    "- **Excesso de retorno (a.a.)**: diferença entre os retornos anualizados (períodos ≥ 1 ano).\n"
-                    "- **Alfa (a.a.)**: retorno que sobra depois de descontar a parte explicada pelo benchmark "
-                    "(intercepto da regressão do ativo contra o benchmark, anualizado). Positivo = gestão agregou valor.\n"
+                    "- **Excesso de retorno (a.a.)**: a mesma diferença, mas com os dois retornos anualizados "
+                    "(só aparece em períodos de 1 ano ou mais).\n"
+                    "- **Alfa (a.a.)**: o que a gestão agregou **depois de descontar o efeito do beta**, ou seja, a "
+                    "parte do resultado que veio só de estar mais (ou menos) exposto ao benchmark. Anualizado. "
+                    "Positivo = a gestão agregou valor.\n"
+                    "- **Alfa acumulado (período)**: o mesmo alfa, composto no período inteiro "
+                    "(ex.: 2% ao ano por 3 anos ≈ 6,1%).\n\n"
+                    "##### Diferença × alfa: por que não são a mesma coisa\n"
+                    "A diferença compara só o resultado final. O alfa pergunta: *dado o quanto este ativo costuma "
+                    "acompanhar o benchmark (beta), quanto ele rendeu a mais ou a menos do que o esperado?* "
+                    "Os dois só coincidem quando o beta é 1.\n\n"
+                    "- **Exemplo 1 (fundo agressivo, mercado em alta):** o benchmark sobe 10% e um fundo com beta 1,5 "
+                    "sobe 16%. Diferença = **+6 p.p.**, mas o esperado só pela exposição maior era 1,5 × 10% = 15%. "
+                    "Alfa ≈ **+1%**: quase todo o ganho veio de correr mais risco, não de gestão.\n"
+                    "- **Exemplo 2 (fundo conservador, mercado em queda):** o benchmark cai 10% e um fundo com beta "
+                    "0,5 cai 3%. Diferença = **+7 p.p.**, mas o esperado era 0,5 × (−10%) = −5%. Alfa ≈ **+2%**: "
+                    "a maior parte da vantagem veio de estar menos exposto.\n\n"
+                    "Para comparar na mesma base: **Excesso de retorno (a.a.) × Alfa (a.a.)** (os dois por ano) e "
+                    "**Diferença (p.p.) × Alfa acumulado** (os dois no período inteiro). A distância entre cada par "
+                    "é o efeito do beta.\n\n"
+                    "##### Risco e comportamento\n"
                     "- **Beta**: sensibilidade ao benchmark. 1 = anda junto; 0,5 = metade do movimento; > 1 = amplifica.\n"
-                    "- **Correlação / R²**: quanto o ativo acompanha o benchmark (R² = parcela explicada por ele).\n"
+                    "- **Correlação / R²**: quanto o ativo acompanha o benchmark (R² = parcela do movimento explicada "
+                    "por ele). Com R² baixo, o beta e o alfa são menos confiáveis.\n"
                     "- **Tracking error (a.a.)**: volatilidade da diferença de retornos; quanto o ativo se descola.\n"
                     "- **Information ratio**: excesso médio anualizado ÷ tracking error. Acima de 0,5 é considerado bom.\n"
                     "- **Captura de alta / de baixa**: nos períodos em que o benchmark subiu (caiu), quanto o ativo "
                     "acompanhou. Ideal: captura de alta alta e de baixa baixa.\n"
                     "- **% períodos acima do bench.**: em quantos meses (ou dias) o ativo ganhou do benchmark.\n\n"
-                    "Os cálculos usam retornos mensais quando há 12 meses ou mais em comum (evita distorções de "
-                    "datas entre fundos e índices) e diários em períodos curtos. Ativo e benchmark são sempre "
-                    "comparados na mesma moeda, escolhida em **Comparar em** (R$ ou US$)."
+                    "##### Como é calculado\n"
+                    "Alfa e beta vêm da regressão dos retornos do ativo contra os do benchmark: retornos mensais "
+                    "quando há 12 meses ou mais em comum (evita distorções de datas entre fundos e índices) e "
+                    "diários em períodos curtos. O alfa é medido direto contra o benchmark, sem descontar uma taxa "
+                    "livre de risco. Ativo e benchmark são sempre comparados na mesma moeda, escolhida em "
+                    "**Comparar em** (R\\$ ou US\\$)."
                 )
 
 
